@@ -1,5 +1,5 @@
-// Command drover runs the loop around a shepherd board. Phase 0+1 ships two
-// subcommands: doctor (prove the boundary) and ingest (one signal, one task).
+// Command drover runs the loop around a shepherd board. Subcommands: doctor
+// (prove the boundary), ingest (one signal, one task), daemon (react live).
 package main
 
 import (
@@ -48,8 +48,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest|daemon> [flags]")
 }
 
-// buildLoop wires the Phase 0+1 seams over a store: attention slice, rules,
-// idempotent store executor.
+// buildLoop wires the seams over a store with the deterministic rules policy —
+// used by the daemon, whose live board events are handled by rules.
 func buildLoop(st loop.Store) loop.Loop {
 	return loop.Loop{
 		Assembler: dctx.WorkingContext{Store: st},
@@ -83,17 +83,22 @@ func doctor(ctx context.Context, argv []string) error {
 	return nil
 }
 
-// ingest turns one CLI-supplied signal into one loop run.
+// ingest turns one CLI-supplied signal into one loop run, under the chosen policy.
 func ingest(ctx context.Context, argv []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 	kind := fs.String("kind", "ci.failed", "event kind")
 	link := fs.String("link", "", "link to attach (e.g. CI run URL)")
 	title := fs.String("title", "", "short description of what happened")
 	project := fs.String("project", "", "shepherd board to act on")
+	policyName := fs.String("policy", "rules", "decision policy: rules | llm | shadow")
 	fs.Parse(argv)
 
 	st := store.ShepherdStore{Project: *project}
-	l := buildLoop(st)
+	l := loop.Loop{
+		Assembler: dctx.WorkingContext{Store: st},
+		Policy:    buildPolicy(ctx, *policyName, st),
+		Executor:  exec.StoreExecutor{Store: st},
+	}
 	src := source.GitSource{Event: loop.Event{
 		Kind:    *kind,
 		Source:  "git",
@@ -106,6 +111,39 @@ func ingest(ctx context.Context, argv []string) error {
 		}
 	}
 	return nil
+}
+
+// buildPolicy wires the decision policy named on the CLI. rules is deterministic;
+// llm reasons with Claude and falls back to rules; shadow runs both and acts only
+// on rules while logging the diff. The LLM policies read shepherd's schema
+// (best-effort) and the ANTHROPIC_API_KEY / ant-login profile from the env.
+func buildPolicy(ctx context.Context, name string, st store.ShepherdStore) loop.Policy {
+	rules := policy.RulesPolicy{}
+	if name == "rules" {
+		return rules
+	}
+
+	schema, err := st.Schema(ctx)
+	if err != nil {
+		log.Printf("drover: no shepherd schema (%v); reasoning unconstrained by it", err)
+		schema = nil
+	}
+	llm := policy.LLMReasoner{
+		Reasoner: policy.NewAnthropicReasoner(),
+		Schema:   schema,
+		Timeout:  30 * time.Second,
+		Fallback: rules,
+		Logf:     log.Printf,
+	}
+	switch name {
+	case "shadow":
+		return policy.ShadowPolicy{Trusted: rules, Shadow: llm, Logf: log.Printf}
+	case "llm":
+		return llm
+	default:
+		log.Printf("drover: unknown policy %q; using rules", name)
+		return rules
+	}
 }
 
 // daemon reacts to board changes live: it streams shepherd watch through the

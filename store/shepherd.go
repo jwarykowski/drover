@@ -72,6 +72,13 @@ func (s ShepherdStore) Add(ctx context.Context, spec loop.Spec) (loop.Item, erro
 	return it, nil
 }
 
+// Schema returns shepherd's item JSON Schema (`shepherd schema`), for handing to
+// an LLM policy. Best-effort: older shepherds without the verb return an error
+// the caller can ignore.
+func (s ShepherdStore) Schema(ctx context.Context) ([]byte, error) {
+	return s.run(ctx, "schema")
+}
+
 // SetStatus marks an item done/undone, or sets a named status, addressing by id.
 func (s ShepherdStore) SetStatus(ctx context.Context, id, status string) error {
 	var args []string
