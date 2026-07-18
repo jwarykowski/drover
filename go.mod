@@ -2,7 +2,10 @@ module github.com/jwarykowski/drover
 
 go 1.26.5
 
-require github.com/anthropics/anthropic-sdk-go v1.58.0
+require (
+	github.com/BurntSushi/toml v1.6.0
+	github.com/anthropics/anthropic-sdk-go v1.58.0
+)
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
