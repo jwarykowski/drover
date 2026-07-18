@@ -6,7 +6,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	dctx "github.com/jwarykowski/drover/context"
@@ -29,6 +32,8 @@ func main() {
 		err = doctor(ctx, os.Args[2:])
 	case "ingest":
 		err = ingest(ctx, os.Args[2:])
+	case "daemon":
+		err = daemon(ctx, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -40,7 +45,17 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest|daemon> [flags]")
+}
+
+// buildLoop wires the Phase 0+1 seams over a store: attention slice, rules,
+// idempotent store executor.
+func buildLoop(st loop.Store) loop.Loop {
+	return loop.Loop{
+		Assembler: dctx.WorkingContext{Store: st},
+		Policy:    policy.RulesPolicy{},
+		Executor:  exec.StoreExecutor{Store: st},
+	}
 }
 
 // doctor proves the boundary: read the real board, then add a marked throwaway.
@@ -78,11 +93,7 @@ func ingest(ctx context.Context, argv []string) error {
 	fs.Parse(argv)
 
 	st := store.ShepherdStore{Project: *project}
-	l := loop.Loop{
-		Assembler: dctx.WorkingContext{Store: st},
-		Policy:    policy.RulesPolicy{},
-		Executor:  exec.StoreExecutor{Store: st},
-	}
+	l := buildLoop(st)
 	src := source.GitSource{Event: loop.Event{
 		Kind:    *kind,
 		Source:  "git",
@@ -95,4 +106,47 @@ func ingest(ctx context.Context, argv []string) error {
 		}
 	}
 	return nil
+}
+
+// daemon reacts to board changes live: it streams shepherd watch through the
+// loop until interrupted, reconnecting if shepherd restarts.
+func daemon(ctx context.Context, argv []string) error {
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	project := fs.String("project", "", "shepherd board to watch")
+	interval := fs.Duration("interval", 0, "watch poll interval (0 = shepherd default)")
+	verbose := fs.Bool("verbose", false, "log every event processed")
+	fs.Parse(argv)
+
+	// Cancel on SIGINT/SIGTERM so the watch stream closes and we drain cleanly.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	logger := log.New(os.Stderr, "drover: ", 0)
+	st := store.ShepherdStore{Project: *project}
+	l := buildLoop(st)
+	src := source.WatchSource{
+		Project:  *project,
+		Interval: *interval,
+		Logf:     logger.Printf,
+	}
+
+	logger.Printf("daemon watching board %q", boardName(*project))
+	for e := range src.Events(ctx) {
+		if *verbose {
+			logger.Printf("event %s", e.Kind)
+		}
+		if err := l.Run(ctx, e); err != nil && ctx.Err() == nil {
+			// Keep the daemon alive; one bad event shouldn't take it down.
+			logger.Printf("processing %s: %v", e.Kind, err)
+		}
+	}
+	logger.Printf("daemon stopped")
+	return nil
+}
+
+func boardName(p string) string {
+	if p == "" {
+		return "default"
+	}
+	return p
 }
