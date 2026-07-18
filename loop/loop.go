@@ -63,6 +63,18 @@ type AddTask struct{ Spec Spec }
 
 func (AddTask) isAction() {}
 
+// RunAction fires a named action from drover's trusted config allowlist. The
+// board (and any policy) references an action by Name only — the command body
+// lives in config, never in an item field. Args are typed, validated values
+// substituted into the config template as whole argv elements, never shell.
+type RunAction struct {
+	Name   string            // allowlist key, e.g. "fix-ci"
+	Args   map[string]string // substituted into the config command template
+	Reason string            // why this fired (event kind, task id) — for provenance
+}
+
+func (RunAction) isAction() {}
+
 // Context is the bundle handed to Policy.Decide. Phase 0+1 fills Event and Board
 // only; Profile, Similar, History and a real Tenant are later context tiers and
 // stay zero-valued for now.

@@ -1,0 +1,20 @@
+# drover's OWN config — the action allowlist. This is trusted; the shepherd
+# board is NOT. The board (and any policy) may reference an action by name only.
+# The command body lives here and never comes from a board item, so arbitrary
+# board content can never cause execution.
+#
+# {{key}} placeholders are filled from RunAction.Args as whole argv elements
+# (no shell), so an arg value can't inject a flag or a second command.
+
+# Dispatch a failing CI run to a Claude Code headless agent in the repo.
+[actions.fix-ci]
+cmd     = ["claude", "-p", "{{task}}", "--output-format", "json"]
+cwd     = "/repos/{{repo}}"
+confirm = true
+timeout = "20m"
+
+# Trigger a GitHub Actions workflow. Requires the gh CLI to be authenticated.
+[actions.rerun-ci]
+cmd     = ["gh", "workflow", "run", "ci.yml", "--repo", "{{repo}}", "-f", "run_id={{run}}"]
+confirm = false
+timeout = "2m"

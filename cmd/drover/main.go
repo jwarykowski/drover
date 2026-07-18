@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,6 +35,8 @@ func main() {
 		err = ingest(ctx, os.Args[2:])
 	case "daemon":
 		err = daemon(ctx, os.Args[2:])
+	case "run":
+		err = runAction(ctx, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -45,7 +48,78 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest|daemon> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest|daemon|run> [flags]")
+}
+
+// argMap collects repeated --arg key=value flags.
+type argMap map[string]string
+
+func (m argMap) String() string { return "" }
+func (m argMap) Set(kv string) error {
+	k, v, ok := strings.Cut(kv, "=")
+	if !ok {
+		return fmt.Errorf("expected key=value, got %q", kv)
+	}
+	m[k] = v
+	return nil
+}
+
+// runAction explicitly fires an allowlisted named action:
+//
+//	drover run fix-ci --arg repo=acme/api --arg task="fix the failing run" [--yes]
+//
+// The action name must be in the config allowlist; args fill the config command
+// template. Nothing from a shepherd board is involved, so this can only run what
+// trusted config permits.
+func runAction(ctx context.Context, argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("run: missing action name")
+	}
+	name, rest := argv[0], argv[1:]
+
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	configPath := fs.String("config", "config/config.toml", "path to drover's action allowlist")
+	reason := fs.String("reason", "manual invocation", "why this action is firing (recorded)")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt for confirm=true actions")
+	provPath := fs.String("provenance", "", "append a JSON provenance record to this file")
+	args := argMap{}
+	fs.Var(args, "arg", "key=value substituted into the action command (repeatable)")
+	fs.Parse(rest)
+
+	allow, err := exec.LoadAllowlist(*configPath)
+	if err != nil {
+		return err
+	}
+
+	var prov *os.File
+	if *provPath != "" {
+		prov, err = os.OpenFile(*provPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer prov.Close()
+	}
+
+	x := exec.RunnerExecutor{
+		Allow:      allow,
+		Provenance: prov,
+		Confirm: func(a loop.RunAction, s exec.ActionSpec) bool {
+			if *yes {
+				return true
+			}
+			return confirmTTY(a, s)
+		},
+	}
+	return x.Apply(ctx, []loop.Action{loop.RunAction{Name: name, Args: args, Reason: *reason}})
+}
+
+// confirmTTY prompts on stderr and reads a y/N answer from stdin.
+func confirmTTY(a loop.RunAction, s exec.ActionSpec) bool {
+	fmt.Fprintf(os.Stderr, "run %q %v ? [y/N] ", a.Name, s.Cmd)
+	var ans string
+	fmt.Fscanln(os.Stdin, &ans)
+	ans = strings.ToLower(strings.TrimSpace(ans))
+	return ans == "y" || ans == "yes"
 }
 
 // buildLoop wires the seams over a store with the deterministic rules policy —
