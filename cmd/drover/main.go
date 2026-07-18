@@ -37,6 +37,8 @@ func main() {
 		err = daemon(ctx, os.Args[2:])
 	case "run":
 		err = runAction(ctx, os.Args[2:])
+	case "watch-merges":
+		err = watchMerges(ctx, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -48,7 +50,72 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest|daemon|run> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest|daemon|run|watch-merges> [flags]")
+}
+
+// watchMerges runs the closed loop: poll a repo for merges to a branch, park each
+// as a held agentic task on the board, and when a human releases one (toggles its
+// status) fire the configured skill in the local repo and close the task. It
+// fans the GitHub poller and the shepherd watch stream into one loop.
+func watchMerges(ctx context.Context, argv []string) error {
+	fs := flag.NewFlagSet("watch-merges", flag.ExitOnError)
+	repo := fs.String("repo", "", "upstream repo to watch, owner/name (required)")
+	base := fs.String("base", "master", "branch whose merges are sensed")
+	project := fs.String("project", "", "shepherd board to park tasks on")
+	interval := fs.Duration("interval", time.Minute, "GitHub poll interval")
+	configPath := fs.String("config", "config/config.toml", "path to drover's action allowlist")
+	action := fs.String("action", "run-skill", "allowlist action fired on release")
+	cursor := fs.String("cursor", "", "file holding the last-seen PR number (survives restarts)")
+	provPath := fs.String("provenance", "", "append a JSON provenance record per action to this file")
+	fs.Parse(argv)
+
+	if *repo == "" {
+		return fmt.Errorf("watch-merges: --repo owner/name is required")
+	}
+
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	logger := log.New(os.Stderr, "drover: ", 0)
+	allow, err := exec.LoadAllowlist(*configPath)
+	if err != nil {
+		return err
+	}
+	if _, ok := allow[*action]; !ok {
+		return fmt.Errorf("watch-merges: action %q not in %s", *action, *configPath)
+	}
+
+	var prov *os.File
+	if *provPath != "" {
+		prov, err = os.OpenFile(*provPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer prov.Close()
+	}
+
+	st := store.ShepherdStore{Project: *project}
+	src := source.Merge(
+		source.GitHubSource{Repo: *repo, Base: *base, Interval: *interval, CursorPath: *cursor, Logf: logger.Printf},
+		source.WatchSource{Project: *project, Logf: logger.Printf},
+	)
+	l := loop.Loop{
+		Assembler: dctx.WorkingContext{Store: st},
+		Policy:    policy.MergeFlowPolicy{Action: *action},
+		Executor: exec.RouterExecutor{
+			Store:  exec.StoreExecutor{Store: st},
+			Runner: exec.RunnerExecutor{Allow: allow, Provenance: prov},
+		},
+	}
+
+	logger.Printf("watching %s@%s merges; parking on board %q, firing %q on release", *repo, *base, boardName(*project), *action)
+	for e := range src.Events(ctx) {
+		if err := l.Run(ctx, e); err != nil && ctx.Err() == nil {
+			logger.Printf("processing %s: %v", e.Kind, err)
+		}
+	}
+	logger.Printf("watch-merges stopped")
+	return nil
 }
 
 // argMap collects repeated --arg key=value flags.

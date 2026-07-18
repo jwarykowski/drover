@@ -155,6 +155,9 @@ func buildAddText(s loop.Spec) string {
 	case "L":
 		parts = append(parts, "!l")
 	}
+	if s.Status != "" {
+		parts = append(parts, "status:"+s.Status)
+	}
 	if s.Due != "" {
 		parts = append(parts, "due:"+s.Due)
 	}

@@ -18,3 +18,14 @@ timeout = "20m"
 cmd     = ["gh", "workflow", "run", "ci.yml", "--repo", "{{repo}}", "-f", "run_id={{run}}"]
 confirm = false
 timeout = "2m"
+
+# Fire a Claude Code skill in the local repo when an upstream merge is released.
+# confirm=false because the gate is the shepherd task's status (a human toggles it
+# to release), not a TTY prompt. Fill in your skill trigger and repo path.
+# {{title}} and {{url}} come from the released task; they substitute as whole argv
+# elements (no shell), so an upstream PR title can never inject a flag.
+[actions.run-skill]
+cmd     = ["claude", "-p", "/your-skill upstream merged: {{title}} ({{url}})", "--permission-mode", "acceptEdits"]
+cwd     = "/Users/jwarykowski_1/development/CURRENT_REPO"
+confirm = false
+timeout = "20m"

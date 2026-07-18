@@ -9,28 +9,35 @@ import (
 	"github.com/jwarykowski/drover/loop"
 )
 
-// StoreExecutor applies AddTask actions through a Store, idempotently.
+// StoreExecutor applies board mutations (AddTask, SetStatus) through a Store. It
+// never runs strings sourced from the board.
 type StoreExecutor struct {
 	Store loop.Store
 }
 
-// Apply creates a task per AddTask, skipping any whose link already exists on the
-// board. Dedup is by link until shepherd offers a real idempotency key.
+// Apply handles each board action: AddTask creates a task (skipping any whose
+// link already exists — dedup by link until shepherd offers an idempotency key);
+// SetStatus transitions an existing item by id.
 func (x StoreExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 	for _, a := range actions {
-		add, ok := a.(loop.AddTask)
-		if !ok {
+		switch v := a.(type) {
+		case loop.AddTask:
+			exists, err := x.linkExists(ctx, v.Spec.Link)
+			if err != nil {
+				return err
+			}
+			if exists {
+				continue
+			}
+			if _, err := x.Store.Add(ctx, v.Spec); err != nil {
+				return err
+			}
+		case loop.SetStatus:
+			if err := x.Store.SetStatus(ctx, v.ID, v.Status); err != nil {
+				return err
+			}
+		default:
 			return fmt.Errorf("exec: unsupported action %T", a)
-		}
-		exists, err := x.linkExists(ctx, add.Spec.Link)
-		if err != nil {
-			return err
-		}
-		if exists {
-			continue
-		}
-		if _, err := x.Store.Add(ctx, add.Spec); err != nil {
-			return err
 		}
 	}
 	return nil

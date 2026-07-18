@@ -49,6 +49,7 @@ type Spec struct {
 	Text     string
 	Category string
 	Priority string // H, M or L
+	Status   string // named status, e.g. "hold"; empty means default/open
 	Due      string
 	Link     string
 	Note     string
@@ -74,6 +75,16 @@ type RunAction struct {
 }
 
 func (RunAction) isAction() {}
+
+// SetStatus transitions an existing item by id — the loop's way to close or
+// advance a task it created, not just spawn new ones. "done" is terminal; any
+// other value sets a named status (e.g. "running").
+type SetStatus struct {
+	ID     string
+	Status string
+}
+
+func (SetStatus) isAction() {}
 
 // Context is the bundle handed to Policy.Decide. Phase 0+1 fills Event and Board
 // only; Profile, Similar, History and a real Tenant are later context tiers and
