@@ -116,10 +116,11 @@ func scan(ctx context.Context, r io.Reader, out chan<- loop.Event, logf func(str
 			continue
 		}
 		e := loop.Event{
-			Kind:    "board." + ln.Type,
-			Source:  "shepherd.watch",
-			Payload: map[string]any{"item": ln.Item},
-			At:      time.Now(),
+			ID:     "board:" + ln.Type + ":" + ln.Item.ID,
+			Type:   "board." + ln.Type,
+			Source: "shepherd.watch",
+			Data:   loop.BoardChange{Item: ln.Item},
+			At:     time.Now(),
 		}
 		select {
 		case <-ctx.Done():

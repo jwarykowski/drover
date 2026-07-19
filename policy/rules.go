@@ -13,15 +13,16 @@ import (
 // RulesPolicy is a pure function of Context to Actions — no I/O, table-testable.
 type RulesPolicy struct{}
 
-// Decide applies the Phase 1 rules. Unknown event kinds produce no action.
+// Decide applies the Phase 1 rules. Unknown event types produce no action.
 func (RulesPolicy) Decide(_ context.Context, c loop.Context) []loop.Action {
-	switch c.Event.Kind {
+	switch c.Event.Type {
 	case "ci.failed":
+		g, _ := c.Event.Data.(loop.Generic)
 		return []loop.Action{loop.AddTask{Spec: loop.Spec{
-			Text:     fmt.Sprintf("CI failed: %v", c.Event.Payload["title"]),
+			Text:     fmt.Sprintf("CI failed: %v", g["title"]),
 			Category: "ci",
 			Priority: "H",
-			Link:     str(c.Event.Payload["link"]),
+			Link:     str(g["link"]),
 		}}}
 	default:
 		return nil

@@ -11,8 +11,8 @@ func TestDecide(t *testing.T) {
 	p := RulesPolicy{}
 
 	ciFail := loop.Context{Event: loop.Event{
-		Kind:    "ci.failed",
-		Payload: map[string]any{"title": "build broke", "link": "https://ci/42"},
+		Type: "ci.failed",
+		Data: loop.Generic{"title": "build broke", "link": "https://ci/42"},
 	}}
 	got := p.Decide(context.Background(), ciFail)
 	if len(got) != 1 {
@@ -29,7 +29,7 @@ func TestDecide(t *testing.T) {
 		t.Errorf("wrong text: %q", add.Spec.Text)
 	}
 
-	if got := p.Decide(context.Background(), loop.Context{Event: loop.Event{Kind: "unknown"}}); got != nil {
-		t.Errorf("unknown kind: want nil, got %v", got)
+	if got := p.Decide(context.Background(), loop.Context{Event: loop.Event{Type: "unknown"}}); got != nil {
+		t.Errorf("unknown type: want nil, got %v", got)
 	}
 }

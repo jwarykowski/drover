@@ -4,11 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jwarykowski/drover/loop"
@@ -16,16 +13,15 @@ import (
 
 // GitHubSource senses merges to a branch by polling merged pull requests through
 // the gh CLI (already authenticated — no token handling, no inbound webhook).
-// Each newly-merged PR becomes one github.merged event. A cursor (highest PR
-// number already emitted) makes it at-most-once across polls and restarts; on
-// first run with no cursor it seeds to the current head WITHOUT firing, so
-// history doesn't stampede the board.
+// It emits one github.pull_request.merged event per merged PR every poll; the
+// Dedup decorator keyed on Event.ID drops repeats, so this source carries no
+// cursor of its own. Cold-start "don't fire history" is a one-time Seen preload
+// via SeedIDs in the wiring.
 type GitHubSource struct {
-	Repo       string        // owner/name
-	Base       string        // target branch; defaults to "master"
-	Interval   time.Duration // poll interval; defaults to 60s
-	CursorPath string        // file holding the last-emitted PR number; empty = memory only
-	Logf       func(string, ...any)
+	Repo     string        // owner/name
+	Base     string        // target branch; defaults to "master"
+	Interval time.Duration // poll interval; defaults to 60s
+	Logf     func(string, ...any)
 	// run fetches merged PRs as gh JSON; injectable so tests don't shell out.
 	run func(ctx context.Context, repo, base string) ([]byte, error)
 }
@@ -68,42 +64,25 @@ func (s GitHubSource) runner() func(context.Context, string, string) ([]byte, er
 	return ghMergedPRs
 }
 
-// Events polls until ctx is cancelled, emitting one event per newly-merged PR.
+// Events polls until ctx is cancelled, emitting one event per merged PR seen.
 func (s GitHubSource) Events(ctx context.Context) <-chan loop.Event {
 	out := make(chan loop.Event)
 	go func() {
 		defer close(out)
-		cursor := s.loadCursor()
-		seeded := cursor > 0
 		t := time.NewTicker(s.interval())
 		defer t.Stop()
 		for {
-			prs, err := s.poll(ctx)
+			evs, err := s.poll(ctx)
 			if err != nil && ctx.Err() == nil {
 				s.logf("github poll %s: %v", s.Repo, err)
 			}
-			// Ascending by number so the cursor advances monotonically and events
-			// arrive in merge order.
-			sort.Slice(prs, func(i, j int) bool { return prs[i].Number < prs[j].Number })
-			for _, pr := range prs {
-				if pr.Number <= cursor {
-					continue
-				}
-				cursor = pr.Number
-				if !seeded {
-					continue // first run: adopt the head, don't fire for history
-				}
+			for _, e := range evs {
 				select {
 				case <-ctx.Done():
 					return
-				case out <- s.event(pr):
+				case out <- e:
 				}
 			}
-			if !seeded {
-				s.logf("github seeded %s@%s at PR #%d; watching for newer merges", s.Repo, s.base(), cursor)
-				seeded = true
-			}
-			s.saveCursor(cursor)
 			select {
 			case <-ctx.Done():
 				return
@@ -114,54 +93,56 @@ func (s GitHubSource) Events(ctx context.Context) <-chan loop.Event {
 	return out
 }
 
-func (s GitHubSource) poll(ctx context.Context) ([]ghPR, error) {
-	out, err := s.runner()(ctx, s.Repo, s.base())
+// SeedIDs returns the IDs of currently-merged PRs without emitting them, so a
+// cold start can adopt the head into Seen instead of firing for history.
+func (s GitHubSource) SeedIDs(ctx context.Context) ([]string, error) {
+	evs, err := s.poll(ctx)
 	if err != nil {
 		return nil, err
 	}
+	ids := make([]string, len(evs))
+	for i, e := range evs {
+		ids[i] = e.ID
+	}
+	return ids, nil
+}
+
+func (s GitHubSource) poll(ctx context.Context) ([]loop.Event, error) {
+	raw, err := s.runner()(ctx, s.Repo, s.base())
+	if err != nil {
+		return nil, err
+	}
+	return decodeGitHubPRs(s.Repo, raw)
+}
+
+// decodeGitHubPRs normalises `gh pr list --state merged` JSON into merged-PR
+// events, ascending by number so IDs advance in merge order.
+func decodeGitHubPRs(repo string, raw []byte) ([]loop.Event, error) {
 	var prs []ghPR
-	if err := json.Unmarshal(out, &prs); err != nil {
+	if err := json.Unmarshal(raw, &prs); err != nil {
 		return nil, fmt.Errorf("github: parse gh output: %w", err)
 	}
-	return prs, nil
-}
-
-func (s GitHubSource) event(pr ghPR) loop.Event {
-	return loop.Event{
-		Kind:   "github.merged",
-		Source: "github",
-		Payload: map[string]any{
-			"repo":  s.Repo,
-			"pr":    pr.Number,
-			"title": pr.Title,
-			"url":   pr.URL,
-			"sha":   pr.MergeCommit.OID,
-		},
-		At: time.Now(),
+	sort.Slice(prs, func(i, j int) bool { return prs[i].Number < prs[j].Number })
+	var evs []loop.Event
+	for _, pr := range prs {
+		if pr.MergedAt == "" {
+			continue
+		}
+		evs = append(evs, loop.Event{
+			ID:     fmt.Sprintf("github/%s:pr:%d:merged", repo, pr.Number),
+			Type:   "github.pull_request.merged",
+			Source: "github/" + repo,
+			Data: loop.Signal{
+				Repo:  repo,
+				Title: pr.Title,
+				URL:   pr.URL,
+				Key:   fmt.Sprintf("pr:%d:merged", pr.Number),
+				Extra: map[string]any{"pr": pr.Number, "sha": pr.MergeCommit.OID},
+			},
+			At: time.Now(),
+		})
 	}
-}
-
-// loadCursor reads the last-emitted PR number; 0 (no cursor) means seed on first
-// poll. A malformed file is treated as absent — the seed path is safe.
-func (s GitHubSource) loadCursor() int {
-	if s.CursorPath == "" {
-		return 0
-	}
-	b, err := os.ReadFile(s.CursorPath)
-	if err != nil {
-		return 0
-	}
-	n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-	return n
-}
-
-func (s GitHubSource) saveCursor(n int) {
-	if s.CursorPath == "" || n <= 0 {
-		return
-	}
-	if err := os.WriteFile(s.CursorPath, []byte(strconv.Itoa(n)), 0o644); err != nil {
-		s.logf("github: save cursor: %v", err)
-	}
+	return evs, nil
 }
 
 // ghMergedPRs asks gh for merged PRs against base, newest first.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	osexec "os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"github.com/jwarykowski/drover/exec"
 	"github.com/jwarykowski/drover/loop"
 	"github.com/jwarykowski/drover/policy"
+	"github.com/jwarykowski/drover/registry"
 	"github.com/jwarykowski/drover/source"
 	"github.com/jwarykowski/drover/store"
 )
@@ -37,8 +39,10 @@ func main() {
 		err = daemon(ctx, os.Args[2:])
 	case "run":
 		err = runAction(ctx, os.Args[2:])
-	case "watch-merges":
-		err = watchMerges(ctx, os.Args[2:])
+	case "watch":
+		err = watch(ctx, os.Args[2:])
+	case "action":
+		err = actionCmd(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -50,39 +54,38 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest|daemon|run|watch-merges> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: drover <doctor|ingest|daemon|run|watch|action> [flags]")
 }
 
-// watchMerges runs the closed loop: poll a repo for merges to a branch, park each
-// as a held agentic task on the board, and when a human releases one (toggles its
-// status) fire the configured skill in the local repo and close the task. It
-// fans the GitHub poller and the shepherd watch stream into one loop.
-func watchMerges(ctx context.Context, argv []string) error {
-	fs := flag.NewFlagSet("watch-merges", flag.ExitOnError)
-	repo := fs.String("repo", "", "upstream repo to watch, owner/name (required)")
-	base := fs.String("base", "master", "branch whose merges are sensed")
+// watch runs the closed loop over all configured sources: sense GitHub (+ the
+// board), match each event against the trusted registry to park a held agentic
+// task, and when a human releases one fire its registered agent action and
+// reconcile the task from the agent's verdict. The GitHub sense is push (`gh
+// webhook forward`) by default, poll as a fallback; both dedup on event id.
+func watch(ctx context.Context, argv []string) error {
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	repo := fs.String("repo", "", "GitHub repo to watch, owner/name (required)")
+	base := fs.String("base", "master", "branch whose merges are sensed (poll mode)")
 	project := fs.String("project", "", "shepherd board to park tasks on")
-	interval := fs.Duration("interval", time.Minute, "GitHub poll interval")
-	configPath := fs.String("config", "config/config.toml", "path to drover's action allowlist")
-	action := fs.String("action", "run-skill", "action stamped on raised tasks and fired on release (a task's own action wins)")
-	cursor := fs.String("cursor", "", "file holding the last-seen PR number (survives restarts)")
-	provPath := fs.String("provenance", "", "append a JSON provenance record per action to this file")
+	sourceMode := fs.String("source", "forward", "GitHub sense: forward (gh webhook forward) | poll")
+	addr := fs.String("addr", "127.0.0.1:9099", "local bind for the webhook receiver (forward mode)")
+	interval := fs.Duration("interval", time.Minute, "GitHub poll interval (poll mode)")
+	seenPath := fs.String("seen", "", "file recording handled event ids (survives restarts)")
+	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	provPath := fs.String("provenance", "", "append a JSON provenance record per agent run to this file")
 	fs.Parse(argv)
 
 	if *repo == "" {
-		return fmt.Errorf("watch-merges: --repo owner/name is required")
+		return fmt.Errorf("watch: --repo owner/name is required")
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	logger := log.New(os.Stderr, "drover: ", 0)
-	allow, err := exec.LoadAllowlist(*configPath)
+	reg, err := registry.Load(*regPath)
 	if err != nil {
 		return err
-	}
-	if _, ok := allow[*action]; !ok {
-		return fmt.Errorf("watch-merges: action %q not in %s", *action, *configPath)
 	}
 
 	var prov *os.File
@@ -94,28 +97,247 @@ func watchMerges(ctx context.Context, argv []string) error {
 		defer prov.Close()
 	}
 
+	var seen source.Seen
+	if *seenPath != "" {
+		fseen, err := source.OpenFileSeen(*seenPath)
+		if err != nil {
+			return err
+		}
+		seen = fseen
+	} else {
+		seen = source.NewMemSeen()
+	}
+
+	var ghSrc loop.Source
+	switch *sourceMode {
+	case "poll":
+		gh := source.GitHubSource{Repo: *repo, Base: *base, Interval: *interval, Logf: logger.Printf}
+		if fseen, ok := seen.(*source.FileSeen); ok && fseen.Empty() {
+			if ids, err := gh.SeedIDs(ctx); err == nil {
+				for _, id := range ids {
+					_ = seen.Add(id)
+				}
+				logger.Printf("seeded %d merged PR(s) at head; not firing history", len(ids))
+			} else {
+				logger.Printf("seed: %v", err)
+			}
+		}
+		ghSrc = source.Dedup{Src: gh, Seen: seen, Logf: logger.Printf}
+	default: // forward
+		wh := source.WebhookSource{Repo: *repo, Addr: *addr, Forward: true, Logf: logger.Printf}
+		ghSrc = source.Dedup{Src: wh, Seen: seen, Logf: logger.Printf}
+	}
+
 	st := store.ShepherdStore{Project: *project}
-	src := source.Merge(
-		source.GitHubSource{Repo: *repo, Base: *base, Interval: *interval, CursorPath: *cursor, Logf: logger.Printf},
-		source.WatchSource{Project: *project, Logf: logger.Printf},
-	)
+	src := source.Merge(ghSrc, source.WatchSource{Project: *project, Logf: logger.Printf})
 	l := loop.Loop{
 		Assembler: dctx.WorkingContext{Store: st},
-		Policy:    policy.MergeFlowPolicy{Action: *action},
+		Policy: policy.PolicyRouter{
+			{Prefix: "board.", Policy: policy.Dispatcher{}},
+			{Prefix: "", Policy: policy.Ingress{Registry: reg}},
+		},
 		Executor: exec.RouterExecutor{
-			Store:  exec.StoreExecutor{Store: st},
-			Runner: exec.RunnerExecutor{Allow: allow, Provenance: prov},
+			Store: exec.StoreExecutor{Store: st},
+			Agent: exec.AgentExecutor{Registry: reg, Store: st, Provenance: prov, Timeout: 20 * time.Minute},
 		},
 	}
 
-	logger.Printf("watching %s@%s merges; parking on board %q, firing %q on release", *repo, *base, boardName(*project), *action)
+	logger.Printf("watching %s via %s; parking on board %q, %d action(s) registered", *repo, *sourceMode, boardName(*project), len(reg.Actions))
 	for e := range src.Events(ctx) {
 		if err := l.Run(ctx, e); err != nil && ctx.Err() == nil {
-			logger.Printf("processing %s: %v", e.Kind, err)
+			logger.Printf("processing %s: %v", e.Type, err)
 		}
 	}
-	logger.Printf("watch-merges stopped")
+	logger.Printf("watch stopped")
 	return nil
+}
+
+// actionCmd is the CRUD UI over the trusted registry: `drover action
+// add|list|edit|rm`. This is the only writer of the registry the board
+// references, so it is where events bind to what an agent does.
+func actionCmd(argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("action: missing subcommand (add|list|edit|rm)")
+	}
+	sub, rest := argv[0], argv[1:]
+	switch sub {
+	case "add":
+		return actionAdd(rest)
+	case "list":
+		return actionList(rest)
+	case "edit":
+		return actionEdit(rest)
+	case "rm":
+		return actionRm(rest)
+	default:
+		return fmt.Errorf("action: unknown subcommand %q", sub)
+	}
+}
+
+func actionAdd(argv []string) error {
+	fs := flag.NewFlagSet("action add", flag.ExitOnError)
+	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	name := fs.String("name", "", "friendly label (required)")
+	on := fs.String("on", "", "event type to match (required)")
+	repo := fs.String("repo", "", "optional source repo filter, owner/name")
+	target := fs.String("target", "", "directory the agent runs in (required)")
+	mode := fs.String("mode", "acceptEdits", "claude permission mode")
+	doFile := fs.String("do-file", "", "read the prompt body from this file instead of $EDITOR")
+	fs.Parse(argv)
+
+	if *name == "" || *on == "" || *target == "" {
+		return fmt.Errorf("action add: --name, --on and --target are required")
+	}
+	if !registry.ValidType(*on) {
+		return fmt.Errorf("action add: unknown event type %q; known: %s", *on, strings.Join(registry.KnownEventTypes, ", "))
+	}
+	if !registry.ValidMode(*mode) {
+		return fmt.Errorf("action add: invalid mode %q; valid: %s", *mode, strings.Join(registry.ValidModes, ", "))
+	}
+	do, err := promptBody(*doFile)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(do) == "" {
+		return fmt.Errorf("action add: empty prompt body")
+	}
+
+	reg, err := registry.Load(*regPath)
+	if err != nil {
+		return err
+	}
+	a, _ := reg.Add(registry.Action{Name: *name, On: *on, Repo: *repo, Target: *target, Mode: *mode, Do: do})
+	if err := reg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("added action %s (%s)\n", a.ID, a.Name)
+	return nil
+}
+
+func actionList(argv []string) error {
+	fs := flag.NewFlagSet("action list", flag.ExitOnError)
+	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	fs.Parse(argv)
+	reg, err := registry.Load(*regPath)
+	if err != nil {
+		return err
+	}
+	if len(reg.Actions) == 0 {
+		fmt.Println("no actions registered")
+		return nil
+	}
+	fmt.Println("id        name  on  repo")
+	for _, a := range reg.Actions {
+		fmt.Println(a.Summary())
+	}
+	return nil
+}
+
+func actionEdit(argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("action edit: missing id")
+	}
+	id, rest := argv[0], argv[1:]
+	fs := flag.NewFlagSet("action edit", flag.ExitOnError)
+	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	name := fs.String("name", "", "new label")
+	repo := fs.String("repo", "", "new repo filter")
+	target := fs.String("target", "", "new target directory")
+	mode := fs.String("mode", "", "new permission mode")
+	doFile := fs.String("do-file", "", "replace the prompt body from this file")
+	editDo := fs.Bool("do", false, "replace the prompt body in $EDITOR")
+	fs.Parse(rest)
+
+	reg, err := registry.Load(*regPath)
+	if err != nil {
+		return err
+	}
+	a, ok := reg.ByID(id)
+	if !ok {
+		return fmt.Errorf("action edit: %w", registry.ErrNotFound)
+	}
+	if *name != "" {
+		a.Name = *name
+	}
+	if *repo != "" {
+		a.Repo = *repo
+	}
+	if *target != "" {
+		a.Target = *target
+	}
+	if *mode != "" {
+		if !registry.ValidMode(*mode) {
+			return fmt.Errorf("action edit: invalid mode %q", *mode)
+		}
+		a.Mode = *mode
+	}
+	if *doFile != "" || *editDo {
+		src := *doFile
+		if *editDo {
+			src = ""
+		}
+		do, err := promptBody(src)
+		if err != nil {
+			return err
+		}
+		a.Do = do
+	}
+	_ = reg.Remove(id)
+	a.ID = id
+	reg.Actions = append(reg.Actions, a)
+	if err := reg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("updated action %s\n", id)
+	return nil
+}
+
+func actionRm(argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("action rm: missing id")
+	}
+	id, rest := argv[0], argv[1:]
+	fs := flag.NewFlagSet("action rm", flag.ExitOnError)
+	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	fs.Parse(rest)
+	reg, err := registry.Load(*regPath)
+	if err != nil {
+		return err
+	}
+	if err := reg.Remove(id); err != nil {
+		return err
+	}
+	if err := reg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("removed action %s\n", id)
+	return nil
+}
+
+// promptBody reads the `do` prompt from a file, or opens $EDITOR when file is "".
+func promptBody(file string) (string, error) {
+	if file != "" {
+		b, err := os.ReadFile(file)
+		return string(b), err
+	}
+	ed := os.Getenv("EDITOR")
+	if ed == "" {
+		ed = "vi"
+	}
+	f, err := os.CreateTemp("", "drover-do-*.md")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	f.Close()
+	defer os.Remove(name)
+	cmd := osexec.Command(ed, name)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(name)
+	return string(b), err
 }
 
 // argMap collects repeated --arg key=value flags.
@@ -241,10 +463,10 @@ func ingest(ctx context.Context, argv []string) error {
 		Executor:  exec.StoreExecutor{Store: st},
 	}
 	src := source.GitSource{Event: loop.Event{
-		Kind:    *kind,
-		Source:  "git",
-		Payload: map[string]any{"title": *title, "link": *link},
-		At:      time.Now(),
+		Type:   *kind,
+		Source: "git",
+		Data:   loop.Generic{"title": *title, "link": *link},
+		At:     time.Now(),
 	}}
 	for e := range src.Events(ctx) {
 		if err := l.Run(ctx, e); err != nil {
@@ -312,11 +534,11 @@ func daemon(ctx context.Context, argv []string) error {
 	logger.Printf("daemon watching board %q", boardName(*project))
 	for e := range src.Events(ctx) {
 		if *verbose {
-			logger.Printf("event %s", e.Kind)
+			logger.Printf("event %s", e.Type)
 		}
 		if err := l.Run(ctx, e); err != nil && ctx.Err() == nil {
 			// Keep the daemon alive; one bad event shouldn't take it down.
-			logger.Printf("processing %s: %v", e.Kind, err)
+			logger.Printf("processing %s: %v", e.Type, err)
 		}
 	}
 	logger.Printf("daemon stopped")

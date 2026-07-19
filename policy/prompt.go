@@ -25,11 +25,11 @@ func buildSystemPrompt(schema []byte) string {
 // buildUserPrompt renders the event and the attention slice of the board.
 func buildUserPrompt(event loop.Event, board []loop.Item) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "event kind: %s\n", event.Kind)
+	fmt.Fprintf(&b, "event type: %s\n", event.Type)
 	if event.Source != "" {
 		fmt.Fprintf(&b, "event source: %s\n", event.Source)
 	}
-	for k, v := range event.Payload {
+	for k, v := range payloadFields(event.Data) {
 		fmt.Fprintf(&b, "payload.%s: %v\n", k, v)
 	}
 	fmt.Fprintf(&b, "\nrelevant board (%d item(s)):\n", len(board))
@@ -41,4 +41,19 @@ func buildUserPrompt(event loop.Event, board []loop.Item) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// payloadFields flattens a typed payload into key/value lines for the prompt.
+// The model reasons over these as data, never as instructions.
+func payloadFields(p loop.Payload) map[string]any {
+	switch d := p.(type) {
+	case loop.Generic:
+		return d
+	case loop.Signal:
+		return map[string]any{"repo": d.Repo, "title": d.Title, "url": d.URL}
+	case loop.BoardChange:
+		return map[string]any{"item": d.Item.Text, "status": d.Item.Status}
+	default:
+		return nil
+	}
 }

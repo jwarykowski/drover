@@ -80,6 +80,18 @@ func (f *FakeStore) SetStatus(_ context.Context, id, status string) error {
 	return fmt.Errorf("%w: %s", ErrNotFound, id)
 }
 
+func (f *FakeStore) Note(_ context.Context, id, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.items {
+		if f.items[i].ID == id {
+			f.items[i].Note = text
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s", ErrNotFound, id)
+}
+
 func normPrio(p string) string {
 	switch strings.ToUpper(p) {
 	case "H":

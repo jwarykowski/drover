@@ -21,12 +21,12 @@ func (f fakeReasoner) Propose(context.Context, loop.Event, []loop.Item, []byte) 
 func TestLLMReasonerValidatesProposals(t *testing.T) {
 	r := LLMReasoner{Reasoner: fakeReasoner{specs: []loop.Spec{
 		{Text: "good task", Category: "ci", Priority: "H"},
-		{Text: "", Priority: "H"},        // no text — dropped
+		{Text: "", Priority: "H"},         // no text — dropped
 		{Text: "bad prio", Priority: "X"}, // bad priority — dropped
 		{Text: "bad date", Due: "soon"},   // bad date — dropped
 	}}}
 
-	got := r.Decide(context.Background(), loop.Context{Event: loop.Event{Kind: "ci.failed"}})
+	got := r.Decide(context.Background(), loop.Context{Event: loop.Event{Type: "ci.failed"}})
 	if len(got) != 1 {
 		t.Fatalf("want 1 valid action, got %d", len(got))
 	}
@@ -41,8 +41,8 @@ func TestLLMReasonerFallsBackOnError(t *testing.T) {
 		Fallback: RulesPolicy{},
 	}
 	c := loop.Context{Event: loop.Event{
-		Kind:    "ci.failed",
-		Payload: map[string]any{"title": "boom", "link": "https://ci/1"},
+		Type: "ci.failed",
+		Data: loop.Generic{"title": "boom", "link": "https://ci/1"},
 	}}
 	got := r.Decide(context.Background(), c)
 	if len(got) != 1 {
@@ -57,7 +57,7 @@ func TestShadowPolicyReturnsTrustedOnly(t *testing.T) {
 		Shadow:  LLMReasoner{Reasoner: fakeReasoner{specs: []loop.Spec{{Text: "shadow only"}}}},
 		Logf:    func(string, ...any) { logged = true },
 	}
-	c := loop.Context{Event: loop.Event{Kind: "ci.failed", Payload: map[string]any{"title": "x"}}}
+	c := loop.Context{Event: loop.Event{Type: "ci.failed", Data: loop.Generic{"title": "x"}}}
 	got := p.Decide(context.Background(), c)
 	// Trusted (rules) produces the ci task; shadow's proposal never acts.
 	if len(got) != 1 {

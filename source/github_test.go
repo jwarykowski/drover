@@ -29,32 +29,56 @@ func collect(t *testing.T, src loop.Source, n int) []loop.Event {
 	return got
 }
 
-func TestGitHubSourceSeedsThenFiresOnlyNewer(t *testing.T) {
-	// Poll 1 shows PRs 5 and 6 (seed, no fire). Poll 2 adds PR 7 (fire once).
-	polls := [][]byte{
-		[]byte(`[{"number":6,"title":"b","url":"u6","mergeCommit":{"oid":"s6"}},{"number":5,"title":"a","url":"u5","mergeCommit":{"oid":"s5"}}]`),
-		[]byte(`[{"number":7,"title":"c","url":"u7","mergeCommit":{"oid":"s7"}},{"number":6,"title":"b","url":"u6","mergeCommit":{"oid":"s6"}}]`),
+func TestDecodeGitHubPRs(t *testing.T) {
+	// Out of order and one unmerged PR (empty mergedAt) that must be dropped.
+	raw := []byte(`[
+	  {"number":6,"title":"b","url":"u6","mergedAt":"t","mergeCommit":{"oid":"s6"}},
+	  {"number":5,"title":"a","url":"u5","mergedAt":"t","mergeCommit":{"oid":"s5"}},
+	  {"number":7,"title":"open","url":"u7","mergedAt":"","mergeCommit":{"oid":""}}
+	]`)
+	evs, err := decodeGitHubPRs("acme/api", raw)
+	if err != nil {
+		t.Fatal(err)
 	}
-	i := 0
+	if len(evs) != 2 {
+		t.Fatalf("want 2 merged events (unmerged dropped), got %d", len(evs))
+	}
+	// Ascending by number: 5 then 6.
+	if evs[0].ID != "github/acme/api:pr:5:merged" || evs[0].Type != "github.pull_request.merged" {
+		t.Fatalf("first event wrong: %+v", evs[0])
+	}
+	sig, ok := evs[0].Data.(loop.Signal)
+	if !ok || sig.Title != "a" || sig.URL != "u5" || sig.Repo != "acme/api" {
+		t.Fatalf("signal not populated: %#v", evs[0].Data)
+	}
+}
+
+func TestGitHubSourceEmitsMergedPRs(t *testing.T) {
 	src := GitHubSource{
 		Repo:     "acme/api",
 		Interval: time.Millisecond,
 		run: func(_ context.Context, _, _ string) ([]byte, error) {
-			p := polls[i]
-			if i < len(polls)-1 {
-				i++
-			}
-			return p, nil
+			return []byte(`[{"number":5,"title":"a","url":"u5","mergedAt":"t","mergeCommit":{"oid":"s5"}},{"number":6,"title":"b","url":"u6","mergedAt":"t","mergeCommit":{"oid":"s6"}}]`), nil
 		},
 	}
-	got := collect(t, src, 1)
-	if len(got) != 1 {
-		t.Fatalf("want exactly 1 event (only PR 7), got %d", len(got))
+	got := collect(t, src, 2)
+	if got[0].ID != "github/acme/api:pr:5:merged" || got[1].ID != "github/acme/api:pr:6:merged" {
+		t.Fatalf("want PRs 5 then 6, got %q, %q", got[0].ID, got[1].ID)
 	}
-	if got[0].Kind != "github.merged" || got[0].Payload["pr"] != 7 {
-		t.Fatalf("want github.merged for PR 7, got %s pr=%v", got[0].Kind, got[0].Payload["pr"])
+}
+
+func TestGitHubSourceSeedIDs(t *testing.T) {
+	src := GitHubSource{
+		Repo: "acme/api",
+		run: func(_ context.Context, _, _ string) ([]byte, error) {
+			return []byte(`[{"number":5,"title":"a","url":"u5","mergedAt":"t","mergeCommit":{"oid":"s5"}},{"number":6,"title":"b","url":"u6","mergedAt":"t","mergeCommit":{"oid":"s6"}}]`), nil
+		},
 	}
-	if got[0].Payload["url"] != "u7" || got[0].Payload["repo"] != "acme/api" {
-		t.Fatalf("payload not populated: %#v", got[0].Payload)
+	ids, err := src.SeedIDs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] != "github/acme/api:pr:5:merged" {
+		t.Fatalf("seed ids wrong: %v", ids)
 	}
 }

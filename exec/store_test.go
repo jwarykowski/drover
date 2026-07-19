@@ -24,6 +24,7 @@ func (s *stubStore) Add(_ context.Context, spec loop.Spec) (loop.Item, error) {
 	return it, nil
 }
 func (s *stubStore) SetStatus(_ context.Context, _, _ string) error { return nil }
+func (s *stubStore) Note(_ context.Context, _, _ string) error      { return nil }
 
 func TestApplyDedupByLink(t *testing.T) {
 	st := &stubStore{items: []loop.Item{{ID: "1", Link: "https://ci/42"}}}

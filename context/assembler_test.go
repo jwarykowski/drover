@@ -16,11 +16,11 @@ func TestWorkingContextAttendsToCategory(t *testing.T) {
 	)
 	w := WorkingContext{Store: fs}
 
-	c, err := w.Assemble(context.Background(), loop.Event{Kind: "ci.failed"})
+	c, err := w.Assemble(context.Background(), loop.Event{Type: "ci.failed"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Event.Kind != "ci.failed" {
+	if c.Event.Type != "ci.failed" {
 		t.Errorf("event not carried through: %+v", c.Event)
 	}
 	// ci.failed attends to the ci slice only.
@@ -34,7 +34,7 @@ func TestWorkingContextUnknownKindSeesWholeBoard(t *testing.T) {
 	fs.Seed(loop.Item{Text: "a", Category: "ci"}, loop.Item{Text: "b", Category: "home"})
 	w := WorkingContext{Store: fs}
 
-	c, err := w.Assemble(context.Background(), loop.Event{Kind: "note.added"})
+	c, err := w.Assemble(context.Background(), loop.Event{Type: "note.added"})
 	if err != nil {
 		t.Fatal(err)
 	}

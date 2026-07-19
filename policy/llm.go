@@ -136,7 +136,7 @@ func (p ShadowPolicy) Decide(ctx context.Context, c loop.Context) []loop.Action 
 	trusted := p.Trusted.Decide(ctx, c)
 	shadow := p.Shadow.Decide(ctx, c)
 	if p.Logf != nil {
-		p.Logf("shadow: event=%s trusted=%d shadow=%d", c.Event.Kind, len(trusted), len(shadow))
+		p.Logf("shadow: event=%s trusted=%d shadow=%d", c.Event.Type, len(trusted), len(shadow))
 	}
 	return trusted
 }

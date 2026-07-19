@@ -94,6 +94,13 @@ func (s ShepherdStore) SetStatus(ctx context.Context, id, status string) error {
 	return err
 }
 
+// Note attaches a note to an item by id (`edit <id> note:<text>`). note: takes
+// the rest of the line, so text needn't be escaped here.
+func (s ShepherdStore) Note(ctx context.Context, id, text string) error {
+	_, err := s.run(ctx, "edit", id, "note:"+text, "--json")
+	return err
+}
+
 // run executes shepherd with the project flag prepended, and maps a --json error
 // envelope on stdout to a typed error.
 func (s ShepherdStore) run(ctx context.Context, args ...string) ([]byte, error) {

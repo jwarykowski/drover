@@ -24,9 +24,9 @@ func (w WorkingContext) Assemble(ctx context.Context, e loop.Event) (loop.Contex
 	return loop.Context{Event: e, Board: board}, nil
 }
 
-// filterFor maps an event kind to the slice of the board worth attending to.
+// filterFor maps an event type to the slice of the board worth attending to.
 func filterFor(e loop.Event) loop.Filter {
-	switch e.Kind {
+	switch e.Type {
 	case "ci.failed":
 		return loop.Filter{Category: "ci"}
 	default:

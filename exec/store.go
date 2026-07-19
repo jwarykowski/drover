@@ -16,13 +16,14 @@ type StoreExecutor struct {
 }
 
 // Apply handles each board action: AddTask creates a task (skipping any whose
-// link already exists — dedup by link until shepherd offers an idempotency key);
-// SetStatus transitions an existing item by id.
+// link AND action already exist — dedup by link+action so one event can still
+// raise several distinct actions, while a re-delivery of the same event doesn't
+// double-park); SetStatus transitions an existing item by id.
 func (x StoreExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 	for _, a := range actions {
 		switch v := a.(type) {
 		case loop.AddTask:
-			exists, err := x.linkExists(ctx, v.Spec.Link)
+			exists, err := x.taskExists(ctx, v.Spec.Link, v.Spec.Action)
 			if err != nil {
 				return err
 			}
@@ -43,7 +44,11 @@ func (x StoreExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 	return nil
 }
 
-func (x StoreExecutor) linkExists(ctx context.Context, link string) (bool, error) {
+// taskExists reports whether an item already carries this link and action —
+// so a re-delivered event doesn't double-park, while a different action on the
+// same link still gets its own task. An empty link never dedups (nothing to key
+// on).
+func (x StoreExecutor) taskExists(ctx context.Context, link, action string) (bool, error) {
 	if link == "" {
 		return false, nil
 	}
@@ -52,7 +57,7 @@ func (x StoreExecutor) linkExists(ctx context.Context, link string) (bool, error
 		return false, err
 	}
 	for _, it := range board {
-		if it.Link == link {
+		if it.Link == link && it.Action == action {
 			return true, nil
 		}
 	}
