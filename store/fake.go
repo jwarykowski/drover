@@ -58,7 +58,8 @@ func (f *FakeStore) Add(_ context.Context, s loop.Spec) (loop.Item, error) {
 	it := loop.Item{
 		ID: fmt.Sprintf("fake-%d", f.seq), Index: len(f.items) + 1,
 		Text: s.Text, Category: s.Category, Priority: normPrio(s.Priority),
-		Status: s.Status, Due: s.Due, Link: s.Link, Note: s.Note,
+		Status: s.Status, Agentic: s.Agentic, Action: s.Action,
+		Due: s.Due, Link: s.Link, Note: s.Note,
 	}
 	f.items = append(f.items, it)
 	return it, nil

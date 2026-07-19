@@ -64,7 +64,7 @@ func watchMerges(ctx context.Context, argv []string) error {
 	project := fs.String("project", "", "shepherd board to park tasks on")
 	interval := fs.Duration("interval", time.Minute, "GitHub poll interval")
 	configPath := fs.String("config", "config/config.toml", "path to drover's action allowlist")
-	action := fs.String("action", "run-skill", "allowlist action fired on release")
+	action := fs.String("action", "run-skill", "action stamped on raised tasks and fired on release (a task's own action wins)")
 	cursor := fs.String("cursor", "", "file holding the last-seen PR number (survives restarts)")
 	provPath := fs.String("provenance", "", "append a JSON provenance record per action to this file")
 	fs.Parse(argv)

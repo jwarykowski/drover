@@ -33,6 +33,8 @@ type Item struct {
 	Due       string `json:"due,omitempty"`
 	Link      string `json:"link,omitempty"`
 	Status    string `json:"status,omitempty"`
+	Agentic   bool   `json:"agentic,omitempty"` // task raised and driven by drover (shepherd 0.19.0+)
+	Action    string `json:"action,omitempty"`  // opaque allowlist action to fire on release
 	Note      string `json:"note,omitempty"`
 }
 
@@ -50,6 +52,8 @@ type Spec struct {
 	Category string
 	Priority string // H, M or L
 	Status   string // named status, e.g. "hold"; empty means default/open
+	Agentic  bool   // mark the task agent-driven (shepherd's `agentic` flag)
+	Action   string // opaque action name the agent fires on release (shepherd's `action:`)
 	Due      string
 	Link     string
 	Note     string

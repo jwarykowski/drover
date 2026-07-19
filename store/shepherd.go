@@ -158,6 +158,12 @@ func buildAddText(s loop.Spec) string {
 	if s.Status != "" {
 		parts = append(parts, "status:"+s.Status)
 	}
+	if s.Agentic {
+		parts = append(parts, "agentic")
+	}
+	if s.Action != "" {
+		parts = append(parts, "action:"+s.Action)
+	}
 	if s.Due != "" {
 		parts = append(parts, "due:"+s.Due)
 	}
