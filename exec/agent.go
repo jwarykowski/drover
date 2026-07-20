@@ -74,7 +74,20 @@ func (x AgentExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 		}
 		act, ok := x.Registry.ByID(ra.ActionID)
 		if !ok {
-			return fmt.Errorf("agent: action id %q not in registry", ra.ActionID)
+			// The action was removed (or renamed) between parking and release.
+			// That's a data condition, not a fault: reconcile a note so the
+			// human sees why the released task never ran, rather than logging
+			// and abandoning it claimed with nothing on the board.
+			v := verdict{Status: "blocked", Summary: fmt.Sprintf("action %q no longer registered", ra.ActionID)}
+			recErr := x.reconcile(ctx, ra.TaskID, v)
+			x.write(agentRecord{
+				At: now(), Action: ra.ActionID, Task: ra.TaskID,
+				Status: v.Status, Summary: v.Summary, Outcome: "error: action not in registry",
+			})
+			if recErr != nil {
+				return fmt.Errorf("agent: reconcile %q: %w", ra.TaskID, recErr)
+			}
+			continue
 		}
 
 		prompt := buildAgentPrompt(act, ra.Args)

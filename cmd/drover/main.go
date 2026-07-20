@@ -144,6 +144,16 @@ func watch(ctx context.Context, argv []string) error {
 
 	logger.Printf("watching %s via %s; parking on board %q, %d action(s) registered", *repo, *sourceMode, boardName(*project), len(reg.Actions))
 	for e := range src.Events(ctx) {
+		// Reload the registry each event so `drover action add|edit|rm` take
+		// effect without restarting the daemon. reg is shared by Ingress and
+		// AgentExecutor; mutating it in place updates both. The loop is
+		// single-goroutine, so no lock is needed.
+		// ponytail: unconditional reload of a small TOML; gate on mtime if it grows hot.
+		if fresh, err := registry.Load(*regPath); err == nil {
+			reg.Actions = fresh.Actions
+		} else {
+			logger.Printf("registry reload: %v", err)
+		}
 		if err := l.Run(ctx, e); err != nil && ctx.Err() == nil {
 			logger.Printf("processing %s: %v", e.Type, err)
 		}

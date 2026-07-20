@@ -79,10 +79,27 @@ func TestAgentExecutorMalformedVerdictLeavesRunning(t *testing.T) {
 	}
 }
 
-func TestAgentExecutorUnknownActionErrors(t *testing.T) {
-	x := AgentExecutor{Registry: &registry.Registry{}, Store: &store.FakeStore{}}
-	err := x.Apply(context.Background(), []loop.Action{loop.RunAgent{ActionID: "ghost", TaskID: "t1"}})
-	if err == nil {
-		t.Fatal("an id not in the registry must error, never fall through to execution")
+func TestAgentExecutorUnknownActionNotesLeavesRunning(t *testing.T) {
+	st := &store.FakeStore{}
+	st.Seed(loop.Item{ID: "t1", Status: "running", Agentic: true, Action: "ghost"})
+	ran := false
+	x := AgentExecutor{Registry: &registry.Registry{}, Store: st,
+		run: func(context.Context, string, []string, time.Duration) ([]byte, error) {
+			ran = true
+			return nil, nil
+		},
+	}
+	if err := x.Apply(context.Background(), []loop.Action{loop.RunAgent{ActionID: "ghost", TaskID: "t1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if ran {
+		t.Fatal("a missing action id must never fall through to execution")
+	}
+	items, _ := st.List(context.Background(), loop.Filter{IncludeDone: true})
+	if items[0].Done {
+		t.Fatal("a missing action must NOT close the task")
+	}
+	if items[0].Note == "" {
+		t.Fatal("a missing action should leave a note explaining why the task never ran")
 	}
 }
