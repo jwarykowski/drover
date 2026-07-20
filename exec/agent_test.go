@@ -2,6 +2,7 @@ package exec
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +10,15 @@ import (
 	"github.com/jwarykowski/drover/registry"
 	"github.com/jwarykowski/drover/store"
 )
+
+func TestBuildAgentPromptNamesRepoFromURL(t *testing.T) {
+	// Repo-agnostic action (no Repo filter): repo must come from the PR url.
+	a := registry.Action{On: "github.pull_request.merged", Do: "x"}
+	p := buildAgentPrompt(a, map[string]string{"title": "t", "url": "https://github.com/acme/api/pull/7"})
+	if !strings.Contains(p, "repo:  acme/api") {
+		t.Fatalf("repo not derived from url:\n%s", p)
+	}
+}
 
 func TestAgentExecutorDoneReconciles(t *testing.T) {
 	reg := &registry.Registry{Actions: []registry.Action{
