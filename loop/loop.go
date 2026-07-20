@@ -41,15 +41,10 @@ type Signal struct {
 // stream, consumed by the release policy.
 type BoardChange struct{ Item Item }
 
-// Generic is the untyped escape hatch for manual ingest paths not yet given a
-// typed payload (e.g. `drover ingest`).
-type Generic map[string]any
-
 func (Signal) isPayload()      {}
 func (BoardChange) isPayload() {}
-func (Generic) isPayload()     {}
 
-// Item mirrors a shepherd item as emitted by `shepherd list --json` (0.15.0).
+// Item mirrors a shepherd item as emitted by `shepherd list --json`.
 // ID is stable across board reorders; Index is not, so mutations address ID.
 type Item struct {
 	ID        string `json:"id"`
@@ -63,7 +58,7 @@ type Item struct {
 	Due       string `json:"due,omitempty"`
 	Link      string `json:"link,omitempty"`
 	Status    string `json:"status,omitempty"`
-	Agentic   bool   `json:"agentic,omitempty"` // task raised and driven by drover (shepherd 0.19.0+)
+	Agentic   bool   `json:"agentic,omitempty"` // task raised and driven by drover
 	Action    string `json:"action,omitempty"`  // opaque allowlist action to fire on release
 	Note      string `json:"note,omitempty"`
 }
@@ -142,7 +137,7 @@ type Context struct {
 	Tenant string // scopes retrieval once the later tiers exist; empty in P0+1
 }
 
-// Source senses events. GitSource is the Phase 1 batch implementation.
+// Source senses events and streams them until its context is cancelled.
 type Source interface {
 	Events(ctx context.Context) <-chan Event
 }
@@ -154,6 +149,7 @@ type Store interface {
 	Add(ctx context.Context, s Spec) (Item, error)
 	SetStatus(ctx context.Context, id, status string) error
 	Note(ctx context.Context, id, text string) error // attach a note to an item by id
+	Archive(ctx context.Context, id string) error    // move an item off the live board (board emits a terminal "archived" event)
 }
 
 // Assembler turns an event into the Context a policy reasons over. The Phase 0+1

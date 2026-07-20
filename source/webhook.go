@@ -19,7 +19,7 @@ import (
 // http.Server to 127.0.0.1 (localhost-only, so no TLS/HMAC) and turns each
 // forwarded delivery into a typed event.
 //
-// ponytail: localhost only; add HMAC verification + a public bind when a remote
+// localhost only; add HMAC verification + a public bind when a remote
 // receiver deployment is real.
 type WebhookSource struct {
 	Repo    string   // owner/name, for `gh webhook forward --repo` and logging

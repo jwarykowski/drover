@@ -49,7 +49,7 @@ func (p Dispatcher) Decide(_ context.Context, c loop.Context) []loop.Action {
 	if !it.Agentic || it.Action == "" || it.Status != p.ready() {
 		return nil
 	}
-	// ponytail: tiny TOCTOU between this read and the running write — shepherd has
+	// tiny TOCTOU between this read and the running write — shepherd has
 	// no atomic CAS. Window is two CLI calls vs. a 20-min agent run, so acceptable.
 	return []loop.Action{
 		loop.SetStatus{ID: it.ID, Status: p.running()},

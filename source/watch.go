@@ -24,7 +24,7 @@ type WatchSource struct {
 }
 
 // watchLine is one NDJSON record from `shepherd watch`: a change (added/updated/
-// removed) carries item; the initial snapshot carries items.
+// removed/archived) carries item; the initial snapshot carries items.
 type watchLine struct {
 	Type  string      `json:"type"`
 	Item  loop.Item   `json:"item"`

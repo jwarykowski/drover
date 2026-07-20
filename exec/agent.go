@@ -179,10 +179,17 @@ func (x *AgentExecutor) handle(ctx context.Context, ra loop.RunAgent) error {
 	return nil
 }
 
-// reconcile writes the agent's outcome back to the board: done closes the task
-// (with the summary as a note); anything else leaves it running (claimed, for
-// inspection) with a note. Followups are added as plain todos the human triages.
+// reconcile writes the agent's outcome back to the board: done notes the summary,
+// stamps the task done, then archives it off the live board; anything else leaves
+// it running (claimed, for inspection) with a note. Followups are added as plain
+// todos the human triages.
 func (x *AgentExecutor) reconcile(ctx context.Context, taskID string, v verdict) error {
+	// Detached (fire-and-forget) run: a terminal board event (removed/archived)
+	// has no live task to write back to, so BoardTrigger sends an empty TaskID.
+	// The run's side effects are the point; the verdict and followups are dropped.
+	if taskID == "" {
+		return nil
+	}
 	switch v.Status {
 	case "done":
 		if v.Summary != "" {
@@ -190,7 +197,13 @@ func (x *AgentExecutor) reconcile(ctx context.Context, taskID string, v verdict)
 				return err
 			}
 		}
+		// Stamp done first (so the item carries its completion in shepherd's
+		// stats/history), then archive it off the live board — a completed
+		// agentic task is done with, and the archive keeps the board clean.
 		if err := x.Store.SetStatus(ctx, taskID, "done"); err != nil {
+			return err
+		}
+		if err := x.Store.Archive(ctx, taskID); err != nil {
 			return err
 		}
 	default: // failed | blocked | unknown — leave running for inspection

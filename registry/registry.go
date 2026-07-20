@@ -65,6 +65,15 @@ var KnownEventTypes = []string{
 	"github.pull_request.merged",
 	"github.issues.opened",
 	"sentry.issue.opened",
+	// Board changes (shepherd watch), handled by BoardTrigger — human-authored
+	// items only. added/updated fire on the live item and reconcile a verdict;
+	// removed/archived are terminal, so they fire-and-forget off the event payload.
+	// shepherd emits the bare "archived" watch type when an item is moved
+	// off the board (per-item `archive`), distinct from a plain "removed".
+	"board.added",
+	"board.updated",
+	"board.removed",
+	"board.archived",
 }
 
 // ValidModes are the claude permission modes an action may request.

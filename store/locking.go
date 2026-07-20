@@ -39,3 +39,9 @@ func (l *Locking) Note(ctx context.Context, id, text string) error {
 	defer l.mu.Unlock()
 	return l.Store.Note(ctx, id, text)
 }
+
+func (l *Locking) Archive(ctx context.Context, id string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.Store.Archive(ctx, id)
+}

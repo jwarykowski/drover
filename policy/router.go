@@ -28,3 +28,18 @@ func (r PolicyRouter) Decide(ctx context.Context, c loop.Context) []loop.Action 
 	}
 	return nil
 }
+
+// Chain runs several policies for one event and concatenates their actions, so
+// two policies can share a router prefix (PolicyRouter is first-match and would
+// otherwise pick only one). Members are expected to be mutually exclusive on a
+// given event — Dispatcher fires on agentic items, BoardTrigger on human-authored
+// ones — so the concatenation never double-acts on the same item.
+type Chain []loop.Policy
+
+func (c Chain) Decide(ctx context.Context, cx loop.Context) []loop.Action {
+	var out []loop.Action
+	for _, p := range c {
+		out = append(out, p.Decide(ctx, cx)...)
+	}
+	return out
+}

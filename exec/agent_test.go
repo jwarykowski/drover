@@ -45,25 +45,29 @@ func TestAgentExecutorDoneReconciles(t *testing.T) {
 		t.Fatalf("argv wrong: %v", gotArgv)
 	}
 
+	// A done verdict archives the task off the live board (leaving the followup).
 	items, _ := st.List(context.Background(), loop.Filter{IncludeDone: true})
-	var t1 loop.Item
 	var followup bool
 	for _, it := range items {
 		if it.ID == "t1" {
-			t1 = it
+			t.Fatal("done task should be archived off the live board")
 		}
 		if it.Text == "regen docs" {
 			followup = true
 		}
 	}
-	if !t1.Done {
-		t.Fatal("done verdict should close the task")
-	}
-	if t1.Note != "bumped" {
-		t.Fatalf("summary not noted: %q", t1.Note)
-	}
 	if !followup {
 		t.Fatal("followup not added as a todo")
+	}
+	arc := st.Archived()
+	if len(arc) != 1 || arc[0].ID != "t1" {
+		t.Fatalf("task not archived: %+v", arc)
+	}
+	if !arc[0].Done {
+		t.Fatal("archived task should be stamped done")
+	}
+	if arc[0].Note != "bumped" {
+		t.Fatalf("summary not noted: %q", arc[0].Note)
 	}
 }
 
@@ -116,12 +120,11 @@ func TestAgentExecutorPoolDoesNotBlockSensing(t *testing.T) {
 		t.Fatal("Apply blocked on a running agent — sensing would stall")
 	}
 
-	close(release) // let both runs finish; both tasks must reconcile to done
+	close(release) // let both runs finish; both tasks must reconcile (done → archived)
 	deadline := time.After(2 * time.Second)
 	for {
-		items, _ := st.List(context.Background(), loop.Filter{IncludeDone: true})
 		done := 0
-		for _, it := range items {
+		for _, it := range st.Archived() {
 			if it.Done {
 				done++
 			}
@@ -131,9 +134,32 @@ func TestAgentExecutorPoolDoesNotBlockSensing(t *testing.T) {
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("both tasks not reconciled; done=%d", done)
+			t.Fatalf("both tasks not reconciled; archived-done=%d", done)
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestAgentExecutorDetachedRunSkipsReconcile(t *testing.T) {
+	reg := &registry.Registry{Actions: []registry.Action{{ID: "a1", Target: "/tmp"}}}
+	st := &store.FakeStore{}
+	ran := false
+	x := AgentExecutor{Registry: reg, Store: st,
+		run: func(context.Context, string, []string, time.Duration) ([]byte, error) {
+			ran = true
+			return []byte(`{"status":"done","summary":"cleaned","followups":["x"]}`), nil
+		},
+	}
+	// Empty TaskID (terminal board event) → run, but no board write-back.
+	if err := x.Apply(context.Background(), []loop.Action{loop.RunAgent{ActionID: "a1", TaskID: ""}}); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("detached action should still run the agent")
+	}
+	items, _ := st.List(context.Background(), loop.Filter{IncludeDone: true})
+	if len(items) != 0 {
+		t.Fatalf("detached run must not touch the board (no reconcile, no followups): %#v", items)
 	}
 }
 

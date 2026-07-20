@@ -54,7 +54,7 @@ func (d Dedup) Events(ctx context.Context) <-chan loop.Event {
 // FileSeen is a Seen backed by a newline-delimited file: ids are loaded into a
 // set on open and appended on Add.
 //
-// ponytail: append-only flat file, compact if it ever grows large.
+// append-only flat file, compact if it ever grows large.
 type FileSeen struct {
 	path string
 	mu   sync.Mutex
