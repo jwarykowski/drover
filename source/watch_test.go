@@ -38,6 +38,29 @@ func TestScanEmitsChangesSkipsSnapshot(t *testing.T) {
 	}
 }
 
+func TestScanReplaysAgenticSnapshotItems(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"snapshot","items":[{"id":"1","text":"plain"},{"id":"2","text":"held","agentic":true,"status":"go","action":"a1"}]}`,
+	}, "\n")
+	out := make(chan loop.Event, 8)
+	if err := scan(context.Background(), strings.NewReader(stream), out, nil); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+
+	var got []loop.Event
+	for e := range out {
+		got = append(got, e)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 event (only the agentic snapshot item), got %d", len(got))
+	}
+	bc, ok := got[0].Data.(loop.BoardChange)
+	if got[0].Type != "board.updated" || !ok || bc.Item.ID != "2" {
+		t.Fatalf("wrong snapshot replay: %+v", got[0])
+	}
+}
+
 func TestScanStopsOnContextCancel(t *testing.T) {
 	// Unbuffered channel with no consumer: the first send blocks, so a cancelled
 	// context must unblock scan rather than hang.

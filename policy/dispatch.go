@@ -36,11 +36,21 @@ func (p Dispatcher) Decide(_ context.Context, c loop.Context) []loop.Action {
 	if !ok {
 		return nil
 	}
-	it := b.Item
-	// Only an agentic task the human has released, with an action to fire.
+	// Claim on the item's LIVE status from the assembled board, not the status
+	// embedded in the event: a snapshot replayed on reconnect can report `go` for
+	// a task drover already claimed `running`, and trusting it would double-fire.
+	// Resolving live makes a replay idempotent while a genuine re-release (a
+	// non-running task back at `go`) still fires. Absent from the live board (done
+	// or removed) means don't fire.
+	it, ok := liveItem(c.Board, b.Item.ID)
+	if !ok {
+		return nil
+	}
 	if !it.Agentic || it.Action == "" || it.Status != p.ready() {
 		return nil
 	}
+	// ponytail: tiny TOCTOU between this read and the running write — shepherd has
+	// no atomic CAS. Window is two CLI calls vs. a 20-min agent run, so acceptable.
 	return []loop.Action{
 		loop.SetStatus{ID: it.ID, Status: p.running()},
 		loop.RunAgent{
@@ -49,4 +59,13 @@ func (p Dispatcher) Decide(_ context.Context, c loop.Context) []loop.Action {
 			Args:     map[string]string{"title": it.Note, "url": it.Link, "id": it.ID},
 		},
 	}
+}
+
+func liveItem(board []loop.Item, id string) (loop.Item, bool) {
+	for _, it := range board {
+		if it.ID == id {
+			return it, true
+		}
+	}
+	return loop.Item{}, false
 }
