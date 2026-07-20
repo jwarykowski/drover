@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/BurntSushi/toml"
 )
@@ -30,10 +31,26 @@ type Action struct {
 	Do     string `toml:"do"`             // the prompt body
 }
 
-// Registry is the loaded action set plus the path it came from.
+// Registry is the loaded action set plus the path it came from. mu guards
+// Actions so the watch daemon can Reload it (from the sensing goroutine) while
+// agent workers resolve ids concurrently.
 type Registry struct {
 	Path    string
+	mu      sync.RWMutex
 	Actions []Action
+}
+
+// Reload swaps Actions for a fresh read of path, under the write lock, so
+// `drover action add|edit|rm` take effect in a running daemon without a race.
+func (r *Registry) Reload(path string) error {
+	fresh, err := Load(path)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.Actions = fresh.Actions
+	r.mu.Unlock()
+	return nil
 }
 
 type file struct {
@@ -89,6 +106,8 @@ func (r *Registry) Save() error {
 // Match returns the actions listening for evType whose repo filter is empty or
 // equals repo.
 func (r *Registry) Match(evType, repo string) []Action {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	var out []Action
 	for _, a := range r.Actions {
 		if a.On == evType && (a.Repo == "" || a.Repo == repo) {
@@ -100,6 +119,8 @@ func (r *Registry) Match(evType, repo string) []Action {
 
 // ByID resolves a fired task's action reference back to its row.
 func (r *Registry) ByID(id string) (Action, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for _, a := range r.Actions {
 		if a.ID == id {
 			return a, true

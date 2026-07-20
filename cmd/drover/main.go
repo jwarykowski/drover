@@ -73,6 +73,7 @@ func watch(ctx context.Context, argv []string) error {
 	seenPath := fs.String("seen", "", "file recording handled event ids (survives restarts)")
 	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
 	provPath := fs.String("provenance", "", "append a JSON provenance record per agent run to this file")
+	agents := fs.Int("agents", 1, "number of agent runs to allow in parallel")
 	fs.Parse(argv)
 
 	if *repo == "" {
@@ -128,7 +129,12 @@ func watch(ctx context.Context, argv []string) error {
 		ghSrc = source.Dedup{Src: wh, Seen: seen, Logf: logger.Printf}
 	}
 
-	st := store.ShepherdStore{Project: *project}
+	// One locked store shared by the assembler, the store executor and the agent
+	// workers so concurrent shepherd calls (file-locked) never overlap.
+	st := &store.Locking{Store: store.ShepherdStore{Project: *project}}
+	ae := &exec.AgentExecutor{Registry: reg, Store: st, Provenance: prov, Timeout: 20 * time.Minute, Concurrency: *agents, Logf: logger.Printf}
+	ae.Start(ctx)
+
 	src := source.Merge(ghSrc, source.WatchSource{Project: *project, Logf: logger.Printf})
 	l := loop.Loop{
 		Assembler: dctx.WorkingContext{Store: st},
@@ -138,20 +144,17 @@ func watch(ctx context.Context, argv []string) error {
 		},
 		Executor: exec.RouterExecutor{
 			Store: exec.StoreExecutor{Store: st},
-			Agent: exec.AgentExecutor{Registry: reg, Store: st, Provenance: prov, Timeout: 20 * time.Minute},
+			Agent: ae,
 		},
 	}
 
-	logger.Printf("watching %s via %s; parking on board %q, %d action(s) registered", *repo, *sourceMode, boardName(*project), len(reg.Actions))
+	logger.Printf("watching %s via %s; parking on board %q, %d action(s) registered, %d agent(s)", *repo, *sourceMode, boardName(*project), len(reg.Actions), *agents)
 	for e := range src.Events(ctx) {
 		// Reload the registry each event so `drover action add|edit|rm` take
-		// effect without restarting the daemon. reg is shared by Ingress and
-		// AgentExecutor; mutating it in place updates both. The loop is
-		// single-goroutine, so no lock is needed.
+		// effect without restarting the daemon. reg is shared (guarded by its own
+		// lock) with the concurrent agent workers.
 		// ponytail: unconditional reload of a small TOML; gate on mtime if it grows hot.
-		if fresh, err := registry.Load(*regPath); err == nil {
-			reg.Actions = fresh.Actions
-		} else {
+		if err := reg.Reload(*regPath); err != nil {
 			logger.Printf("registry reload: %v", err)
 		}
 		if err := l.Run(ctx, e); err != nil && ctx.Err() == nil {

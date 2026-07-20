@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jwarykowski/drover/loop"
@@ -25,13 +26,49 @@ import (
 // fixed board vocabulary (done / note / add followup); drover never executes a
 // string the agent returns.
 type AgentExecutor struct {
-	Registry   *registry.Registry
-	Store      loop.Store
-	Bin        string        // agent binary; defaults to "claude"
-	Timeout    time.Duration // per-run deadline; 0 means none beyond ctx
-	Provenance io.Writer
+	Registry    *registry.Registry
+	Store       loop.Store
+	Bin         string        // agent binary; defaults to "claude"
+	Timeout     time.Duration // per-run deadline; 0 means none beyond ctx
+	Provenance  io.Writer
+	Concurrency int                  // worker count once Start is called; <1 means 1
+	Logf        func(string, ...any) // worker error sink
 	// run executes the agent and returns its stdout; injectable for tests.
 	run func(ctx context.Context, cwd string, argv []string, timeout time.Duration) ([]byte, error)
+
+	jobs   chan agentJob // non-nil once Start ran: Apply enqueues instead of running inline
+	provMu sync.Mutex    // serialises provenance writes across workers
+}
+
+// agentJob is one released task handed to a worker.
+type agentJob struct {
+	ctx context.Context
+	ra  loop.RunAgent
+}
+
+// Start launches the worker pool. Until it is called, Apply runs agents inline
+// (synchronous — the default for tests and one-shot paths). After it is called,
+// Apply enqueues to the pool so a long agent run never blocks the sensing loop.
+func (x *AgentExecutor) Start(ctx context.Context) {
+	n := x.Concurrency
+	if n < 1 {
+		n = 1
+	}
+	x.jobs = make(chan agentJob, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case j := <-x.jobs:
+					if err := x.handle(j.ctx, j.ra); err != nil && x.Logf != nil {
+						x.Logf("agent: %v", err)
+					}
+				}
+			}
+		}()
+	}
 }
 
 // verdict is the JSON the wrapping prompt asks the agent to end with.
@@ -52,73 +89,92 @@ type agentRecord struct {
 	Outcome   string `json:"outcome"` // fired | error: ...
 }
 
-func (x AgentExecutor) bin() string {
+func (x *AgentExecutor) bin() string {
 	if x.Bin == "" {
 		return "claude"
 	}
 	return x.Bin
 }
 
-func (x AgentExecutor) runner() func(context.Context, string, []string, time.Duration) ([]byte, error) {
+func (x *AgentExecutor) runner() func(context.Context, string, []string, time.Duration) ([]byte, error) {
 	if x.run != nil {
 		return x.run
 	}
 	return agentRun
 }
 
-func (x AgentExecutor) Apply(ctx context.Context, actions []loop.Action) error {
+// Apply enqueues each RunAgent to the worker pool (if Start ran) so sensing
+// keeps flowing, or runs it inline otherwise. The claim to `running` is applied
+// by StoreExecutor before this, so the board already reflects the claim.
+func (x *AgentExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 	for _, a := range actions {
 		ra, ok := a.(loop.RunAgent)
 		if !ok {
 			return fmt.Errorf("agent: unsupported action %T", a)
 		}
-		act, ok := x.Registry.ByID(ra.ActionID)
-		if !ok {
-			// The action was removed (or renamed) between parking and release.
-			// That's a data condition, not a fault: reconcile a note so the
-			// human sees why the released task never ran, rather than logging
-			// and abandoning it claimed with nothing on the board.
-			v := verdict{Status: "blocked", Summary: fmt.Sprintf("action %q no longer registered", ra.ActionID)}
-			recErr := x.reconcile(ctx, ra.TaskID, v)
-			x.write(agentRecord{
-				At: now(), Action: ra.ActionID, Task: ra.TaskID,
-				Status: v.Status, Summary: v.Summary, Outcome: "error: action not in registry",
-			})
-			if recErr != nil {
-				return fmt.Errorf("agent: reconcile %q: %w", ra.TaskID, recErr)
+		if x.jobs != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case x.jobs <- agentJob{ctx: ctx, ra: ra}:
 			}
 			continue
 		}
-
-		prompt := buildAgentPrompt(act, ra.Args)
-		argv := []string{x.bin(), "-p", prompt, "--permission-mode", mode(act.Mode)}
-		target := expandPath(act.Target)
-
-		out, runErr := x.runner()(ctx, target, argv, x.Timeout)
-		v := parseVerdict(out)
-		if runErr != nil {
-			v.Status = "failed"
-			if v.Summary == "" {
-				v.Summary = runErr.Error()
-			}
+		if err := x.handle(ctx, ra); err != nil {
+			return err
 		}
+	}
+	return nil
+}
 
+// handle resolves, runs and reconciles one released task.
+func (x *AgentExecutor) handle(ctx context.Context, ra loop.RunAgent) error {
+	act, ok := x.Registry.ByID(ra.ActionID)
+	if !ok {
+		// The action was removed (or renamed) between parking and release.
+		// That's a data condition, not a fault: reconcile a note so the
+		// human sees why the released task never ran, rather than logging
+		// and abandoning it claimed with nothing on the board.
+		v := verdict{Status: "blocked", Summary: fmt.Sprintf("action %q no longer registered", ra.ActionID)}
 		recErr := x.reconcile(ctx, ra.TaskID, v)
-		outcome := "fired"
-		if runErr != nil {
-			outcome = "error: " + runErr.Error()
-		}
 		x.write(agentRecord{
-			At: now(), Action: act.ID, Task: ra.TaskID, Target: target,
-			Status: v.Status, Summary: v.Summary, Followups: len(v.Followups),
-			Outcome: outcome,
+			At: now(), Action: ra.ActionID, Task: ra.TaskID,
+			Status: v.Status, Summary: v.Summary, Outcome: "error: action not in registry",
 		})
-		if runErr != nil {
-			return fmt.Errorf("agent: action %q: %w", act.ID, runErr)
-		}
 		if recErr != nil {
 			return fmt.Errorf("agent: reconcile %q: %w", ra.TaskID, recErr)
 		}
+		return nil
+	}
+
+	prompt := buildAgentPrompt(act, ra.Args)
+	argv := []string{x.bin(), "-p", prompt, "--permission-mode", mode(act.Mode)}
+	target := expandPath(act.Target)
+
+	out, runErr := x.runner()(ctx, target, argv, x.Timeout)
+	v := parseVerdict(out)
+	if runErr != nil {
+		v.Status = "failed"
+		if v.Summary == "" {
+			v.Summary = runErr.Error()
+		}
+	}
+
+	recErr := x.reconcile(ctx, ra.TaskID, v)
+	outcome := "fired"
+	if runErr != nil {
+		outcome = "error: " + runErr.Error()
+	}
+	x.write(agentRecord{
+		At: now(), Action: act.ID, Task: ra.TaskID, Target: target,
+		Status: v.Status, Summary: v.Summary, Followups: len(v.Followups),
+		Outcome: outcome,
+	})
+	if runErr != nil {
+		return fmt.Errorf("agent: action %q: %w", act.ID, runErr)
+	}
+	if recErr != nil {
+		return fmt.Errorf("agent: reconcile %q: %w", ra.TaskID, recErr)
 	}
 	return nil
 }
@@ -126,7 +182,7 @@ func (x AgentExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 // reconcile writes the agent's outcome back to the board: done closes the task
 // (with the summary as a note); anything else leaves it running (claimed, for
 // inspection) with a note. Followups are added as plain todos the human triages.
-func (x AgentExecutor) reconcile(ctx context.Context, taskID string, v verdict) error {
+func (x *AgentExecutor) reconcile(ctx context.Context, taskID string, v verdict) error {
 	switch v.Status {
 	case "done":
 		if v.Summary != "" {
@@ -157,12 +213,14 @@ func (x AgentExecutor) reconcile(ctx context.Context, taskID string, v verdict) 
 	return nil
 }
 
-func (x AgentExecutor) write(r agentRecord) {
+func (x *AgentExecutor) write(r agentRecord) {
 	if x.Provenance == nil {
 		return
 	}
 	if b, err := json.Marshal(r); err == nil {
+		x.provMu.Lock()
 		_, _ = x.Provenance.Write(append(b, '\n'))
+		x.provMu.Unlock()
 	}
 }
 

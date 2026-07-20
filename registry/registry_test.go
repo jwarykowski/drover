@@ -5,6 +5,29 @@ import (
 	"testing"
 )
 
+// TestReloadConcurrentWithMatch exercises the mutex under -race: the daemon
+// reloads the registry from the sensing goroutine while workers resolve ids.
+func TestReloadConcurrentWithMatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.toml")
+	reg := &Registry{Path: path}
+	reg.Add(Action{Name: "x", On: "github.issues.opened", Target: "t"})
+	if err := reg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			_ = reg.Reload(path)
+		}
+		close(done)
+	}()
+	for i := 0; i < 200; i++ {
+		_ = reg.Match("github.issues.opened", "")
+		_, _ = reg.ByID("nope")
+	}
+	<-done
+}
+
 func TestRoundTripAndMatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "actions.toml")
 	reg, err := Load(path) // missing file → empty registry, not an error

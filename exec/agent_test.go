@@ -89,6 +89,54 @@ func TestAgentExecutorMalformedVerdictLeavesRunning(t *testing.T) {
 	}
 }
 
+func TestAgentExecutorPoolDoesNotBlockSensing(t *testing.T) {
+	reg := &registry.Registry{Actions: []registry.Action{{ID: "a1", Target: "/tmp"}}}
+	st := &store.FakeStore{}
+	st.Seed(loop.Item{ID: "t1", Status: "running", Agentic: true, Action: "a1"})
+	st.Seed(loop.Item{ID: "t2", Status: "running", Agentic: true, Action: "a1"})
+
+	release := make(chan struct{})
+	x := &AgentExecutor{Registry: reg, Store: st, Concurrency: 2,
+		run: func(context.Context, string, []string, time.Duration) ([]byte, error) {
+			<-release // hold the run open so a synchronous Apply would block
+			return []byte(`{"status":"done","summary":"ok"}`), nil
+		},
+	}
+	x.Start(context.Background())
+
+	returned := make(chan struct{})
+	go func() {
+		_ = x.Apply(context.Background(), []loop.Action{loop.RunAgent{ActionID: "a1", TaskID: "t1"}})
+		_ = x.Apply(context.Background(), []loop.Action{loop.RunAgent{ActionID: "a1", TaskID: "t2"}})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("Apply blocked on a running agent — sensing would stall")
+	}
+
+	close(release) // let both runs finish; both tasks must reconcile to done
+	deadline := time.After(2 * time.Second)
+	for {
+		items, _ := st.List(context.Background(), loop.Filter{IncludeDone: true})
+		done := 0
+		for _, it := range items {
+			if it.Done {
+				done++
+			}
+		}
+		if done == 2 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("both tasks not reconciled; done=%d", done)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestAgentExecutorUnknownActionNotesLeavesRunning(t *testing.T) {
 	st := &store.FakeStore{}
 	st.Seed(loop.Item{ID: "t1", Status: "running", Agentic: true, Action: "ghost"})
