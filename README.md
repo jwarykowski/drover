@@ -20,12 +20,41 @@ else stays swappable.
 </tr>
 </table>
 
+- [quickstart](#quickstart)
+- [status](#status)
+- [the boundary](#the-boundary)
+- [the seams](#the-seams)
+- [how it works](#how-it-works)
+- [layout](#layout)
+- [trusted config](#trusted-config)
+- [build](#build)
+- [usage](#usage)
+- [design principles](#design-principles)
+- [non-goals (v1)](#non-goals-v1)
+
+## quickstart
+
+```sh
+# 1. teach drover what to do when a PR merges (prompt opens in $EDITOR)
+drover action add --name fix-ci --on github.pull_request.merged \
+  --repo acme/api --target ~/src/acme-api
+
+# 2. sense GitHub + your board, two agents in parallel
+drover watch --repo acme/api --project work --agents 2
+```
+
+3. A PR merges → drover parks **one held task** on the `work` board. Open it in
+   shepherd, flip its status `hold → go`, and the agent runs in `~/src/acme-api`,
+   marking the task done from its verdict. Nothing runs until you release it.
+
+That's the whole loop. `drover doctor` first if you want to prove the boundary
+before wiring anything up.
+
 ## status
 
-drover senses upstream events (GitHub PRs, Sentry issues) and shepherd board
-changes, parks agent-driven tasks behind a human `hold → go` gate, and — on
-release — runs an allowlisted agent in a target repo, reconciling the task from
-the agent's structured verdict. Every step sits behind a clean seam.
+Works end to end — sensing (GitHub PRs, Sentry issues, board changes), the
+`hold → go` review gate, the allowlisted agent run, and reconcile-from-verdict.
+Each step sits behind a clean seam; see [how it works](#how-it-works).
 
 ## the boundary
 
@@ -139,10 +168,30 @@ can never name a command body, only a key:
 - **the registry** (`drover action …`, `~/.config/drover/actions.toml`)
   — agent actions for `RunAgent`. Each row is a stable `id`, an event `on:` to
   match, an optional `repo:` filter, the `target:` directory, a claude `mode:`,
-  and the prompt `do:`. The board references an action by id only.
+  and the prompt `do:`. The board references an action by id only:
+
+  ```toml
+  # normally managed by `drover action add|edit|rm`, not hand-edited
+  [[Actions]]
+  id     = "019f81be59b0…"
+  name   = "fix-ci"
+  on     = "github.pull_request.merged"
+  repo   = "acme/api"          # optional source filter
+  target = "~/src/acme-api"    # the agent's cwd
+  mode   = "acceptEdits"       # claude permission mode
+  do     = "A PR merged. If CI on main is red, open a fix PR."
+  ```
+
 - **the allowlist** (`config/config.toml`) — named commands for `RunAction`,
-  fired by `drover run`. Args substitute as whole argv elements (no shell), with
-  a confirm gate and a provenance record.
+  fired by `drover run`. `{{key}}` placeholders substitute from `--arg` as whole
+  argv elements (no shell), with a confirm gate and a provenance record:
+
+  ```toml
+  [actions.rerun-ci]
+  cmd     = ["gh", "workflow", "run", "ci.yml", "--repo", "{{repo}}"]
+  confirm = false
+  timeout = "2m"
+  ```
 
 ## build
 
