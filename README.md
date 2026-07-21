@@ -1,6 +1,10 @@
-# drover
+<div align="center">
+  <img src="assets/drover.png" alt="drover" width="220">
 
-> drives the flock the shepherd tends.
+  # drover
+
+  > drives the flock the shepherd tends.
+</div>
 
 drover is the sense → assemble-context → act loop **around**
 [shepherd](https://github.com/jwarykowski/shepherd). shepherd stays the dumb,
@@ -11,17 +15,17 @@ else stays swappable.
 
 ## status
 
-All five roadmap phases are built. drover can prove the boundary, turn a signal
-into a task, react live, reason with an LLM, and fire allowlisted actions —
-each behind a clean seam.
+drover senses upstream events (GitHub PRs, Sentry issues) and shepherd board
+changes, parks agent-driven tasks behind a human `hold → go` gate, and — on
+release — runs an allowlisted agent in a target repo, reconciling the task from
+the agent's structured verdict. Every step sits behind a clean seam.
 
 ## the boundary
 
 drover never touches the todo markdown. It speaks shepherd's CLI contract:
-stable item ids, `--json` on every mutating verb, structured errors, `watch`
-(NDJSON), and `schema`. `store/shepherd.go` is the **only** file that knows
-shepherd exists — the loop sees just interfaces, so shepherd is one swappable
-`Store`.
+stable item ids, `--json` on every mutating verb, structured errors, and `watch`
+(NDJSON). `store/shepherd.go` is the **only** file that knows shepherd exists —
+the loop sees just interfaces, so shepherd is one swappable `Store`.
 
 ## the seams
 
@@ -29,100 +33,109 @@ The loop is a handful of interfaces; everything else is an implementation behind
 one.
 
 ```go
-type Source    interface{ Events(ctx) <-chan Event }              // sense
-type Assembler interface{ Assemble(ctx, Event) (Context, error) } // attend
-type Store     interface{ List / Add / SetStatus }                // read + write
-type Policy    interface{ Decide(ctx, Context) []Action }         // think
-type Executor  interface{ Apply(ctx, []Action) error }            // act
+type Source    interface{ Events(ctx) <-chan Event }                    // sense
+type Assembler interface{ Assemble(ctx, Event) (Context, error) }       // attend
+type Store     interface{ List / Add / SetStatus / Note / Archive }     // read + write
+type Policy    interface{ Decide(ctx, Context) []Action }               // think
+type Executor  interface{ Apply(ctx, []Action) error }                  // act
 ```
 
 `Loop.Run`: **event in → assemble the attention slice → decide actions →
-validate → apply.** The loop imports only these interfaces — swap `ShepherdStore`
-for `FakeStore` and it can't tell.
+apply.** The loop imports only these interfaces — swap `ShepherdStore` for
+`FakeStore` and it can't tell.
 
-Actions are a closed vocabulary: `AddTask` (create an item) and `RunAction`
-(fire an allowlisted named command). A policy proposes; the executor validates
-before anything happens.
+Every event carries a sealed `Payload`: a `Signal` (something happened upstream
+— repo, title, url) or a `BoardChange` (a shepherd item that changed). A policy
+switches on the concrete shape, never on raw gh/Sentry JSON.
+
+Actions are a closed vocabulary — a policy proposes, an executor validates and
+applies:
+
+| Action | Effect |
+| --- | --- |
+| `AddTask` | create an item (idempotent by link) |
+| `SetStatus` | transition an item by id (e.g. → `running`, `done`) |
+| `RunAgent` | run an agent action from the trusted **registry**, by id |
+| `RunAction` | fire a named command from the trusted **allowlist** |
+
+## how it works
+
+Two flows share one loop, split by a `PolicyRouter` that matches on event-type
+prefix (first match wins).
+
+**1. upstream signal → held task → human gate → agent run**
+
+```
+PR merged / issue opened / sentry issue
+  → Ingress matches the event (type [+ repo]) against the registry
+  → parks ONE held agentic task per match, carrying the action's id
+  → a human flips hold → go in shepherd            # the review gate
+  → board.updated → Dispatcher claims `running` + emits RunAgent
+  → AgentExecutor resolves the id, runs `claude` in the action's target repo
+  → reconciles the task (done / left running) from the agent's verdict
+```
+
+The hold→go gate is the whole safety story: an agent never runs on untrusted
+event text until a human releases it.
+
+**2. board change → trusted action**
+
+```
+board.{added,updated,removed,archived}   # from `shepherd watch`
+  → BoardTrigger matches human-authored items by type against the registry
+  → added/updated fire on the live item and reconcile a verdict
+  → removed/archived are terminal — fire-and-forget off the event payload
+```
+
+The `board.` route is a `Chain`: `Dispatcher` (agentic tasks, gated) then
+`BoardTrigger` (human-authored items). The catch-all route is `Ingress`.
+
+Sensing is fanned in by `source.Merge`: the GitHub sense (push via
+`gh webhook forward`, or poll) plus `WatchSource` (shepherd's NDJSON stream)
+drive the same loop, both deduped on event id (`--seen` persists across
+restarts). Agent runs go through a bounded worker pool (`--agents N`) so a long
+run never blocks sensing.
 
 ## layout
 
 ```
 drover/
-  cmd/drover/main.go     doctor | ingest | daemon | run
+  cmd/drover/main.go     watch | action | run | doctor
   loop/loop.go           the seams + Loop wiring (interfaces only)
   store/shepherd.go      CLI adapter — the only file that knows shepherd
+  store/locking.go       serialises concurrent shepherd calls (file-locked)
   store/fake.go          in-memory Store for tests
   context/assembler.go   WorkingContext — the attention slice
-  policy/rules.go        deterministic rules
-  policy/llm.go          LLMReasoner + FallbackPolicy + ShadowPolicy
-  policy/anthropic.go    the only file importing the Anthropic SDK
-  source/git.go          GitSource — one-shot batch event
-  source/watch.go        WatchSource — NDJSON stream over `shepherd watch`
-  exec/store.go          StoreExecutor — task mutations, idempotent by link
-  exec/runner.go         RunnerExecutor — allowlisted actions, never board-shell
-  config/config.toml     drover's OWN config: the action allowlist
+  registry/registry.go   the trusted registry of agent actions (RunAgent)
+  policy/router.go       PolicyRouter (prefix match) + Chain
+  policy/ingress.go      signal → held agentic task, via the registry
+  policy/dispatch.go     released agentic task → RunAgent (gated hold→go)
+  policy/boardtrigger.go human-authored board change → RunAgent, by type
+  source/github.go       poll merged PRs
+  source/webhook.go      gh webhook forward receiver (push)
+  source/sentry.go       poll new Sentry issues
+  source/watch.go        WatchSource — NDJSON over `shepherd watch`
+  source/merge.go        fan several sources into one stream
+  source/dedup.go        drop already-handled event ids (mem / file)
+  exec/router.go         RouterExecutor — routes actions to the right executor
+  exec/store.go          StoreExecutor — board mutations, idempotent by link
+  exec/agent.go          AgentExecutor — worker pool, runs `claude`, reconciles
+  exec/runner.go         RunnerExecutor — allowlisted commands, never board-shell
+  config/config.toml     the RunAction allowlist (for `drover run`)
 ```
 
-## the phases
+## trusted config
 
-Each phase is independently valuable and stoppable. Built in order; each layers
-on the last.
+drover keeps two trusted stores, both **outside** the board — so board content
+can never name a command body, only a key:
 
-### phase 0 — skeleton & boundary
-Prove drover can round-trip a real board through the CLI: `drover doctor` lists
-the board and adds a throwaway. The boundary — CLI only, never the file — is set
-here and never crossed again.
-
-### phase 1 — first vertical slice
-One real signal → one correct task, batch. `drover ingest` builds one `Event`;
-`WorkingContext` reads the `@ci` slice; `RulesPolicy` maps `ci.failed → AddTask`;
-`StoreExecutor` adds it, **idempotent by link** (re-running the same event never
-duplicates). Proves the whole thesis end to end.
-
-### phase 2 — harden the boundary
-Multi-writer safe and testable. Mutations address stable **ids**, mutating verbs
-are parsed from `--json`, errors map to typed Go errors. `FakeStore` +
-fake source make the loop and policies testable with no binary and no network;
-`ShepherdStore` gets an integration test against a real binary.
-
-### phase 3 — continuous: watch → daemon
-React live, not only on invocation. `WatchSource` runs `shepherd watch`, parses
-its NDJSON into `board.added`/`updated`/`removed` events, **reconnects** on
-stream drop (survives a shepherd restart) with natural **backpressure** (an
-unbuffered channel paces the reader). `drover daemon` streams those through the
-loop until SIGINT/SIGTERM, draining cleanly.
-
-### phase 4 — intelligence: LLM policy
-Swap or augment rules with a reasoner behind the same `Policy` interface.
-`LLMReasoner` asks Claude for proposals via one **constrained tool call** (a
-fixed vocabulary, never free-form shell), consuming `shepherd schema` so the
-model targets a valid item. Every proposal is **validated before it can act**;
-on timeout or error it **falls back** to rules. `ShadowPolicy` runs rules and
-the LLM on the same events and logs the diff — how the LLM earns trust before
-it's allowed to act. `drover ingest --policy rules|llm|shadow`.
-
-### phase 5 — safe actuation: allowlisted runner
-Let drover *do* things — dispatch a fix to an agent, rerun CI, hit a webhook —
-without becoming an RCE vector. Named actions live in `config/config.toml`
-(drover's trusted config, **not** the board). `RunnerExecutor` fires a named
-action only when it's in the allowlist, substitutes args as whole argv elements
-(no shell; a newline/NUL is rejected), gates `confirm` actions, and writes a
-provenance record of what ran and why. `drover run <name> --arg k=v`.
-
-## how it acts on a signal
-
-```
-event (ci.failed)
-  → policy emits RunAction{name:"fix-ci", args:{repo, task}}   # name from a fixed menu
-  → RunnerExecutor: name allowlisted? → render argv (no shell) → confirm? → fire
-  → cmd body from trusted config, e.g. `claude -p "{{task}}"` in the repo
-  → the agent edits / opens a PR
-  → that PR is the next signal → drover senses it → marks the @ci task done
-```
-
-The board only ever *names* an action; the command body lives in trusted config.
-Board content can never cause execution. The board becomes the audit trail of
-the whole loop.
+- **the registry** (`drover action …`, `~/.config/drover/actions.toml`)
+  — agent actions for `RunAgent`. Each row is a stable `id`, an event `on:` to
+  match, an optional `repo:` filter, the `target:` directory, a claude `mode:`,
+  and the prompt `do:`. The board references an action by id only.
+- **the allowlist** (`config/config.toml`) — named commands for `RunAction`,
+  fired by `drover run`. Args substitute as whole argv elements (no shell), with
+  a confirm gate and a provenance record.
 
 ## build
 
@@ -132,43 +145,47 @@ go test ./...                       # hermetic unit tests
 go test -tags integration ./store/  # round-trip against a real shepherd binary
 ```
 
-Requires the `shepherd` binary on `PATH` (≥ 0.15.0; `--policy llm` wants ≥ 0.17.0
-for `schema`). LLM policies read `ANTHROPIC_API_KEY` or an `ant auth login`
-profile from the environment.
+Runtime needs `shepherd`, `gh`, and `claude` on `PATH` (the integration test
+needs `shepherd`; watching GitHub needs `gh`; agent runs shell `claude`).
 
 ## usage
 
 ```sh
-# prove the boundary
+# prove the boundary: read the board, add a throwaway
 drover doctor --project <board>
 
-# one signal → one task (rules, llm, or shadow)
-drover ingest --kind ci.failed --link "$CI_RUN_URL" --title "build failed" \
-  --project <board> [--policy rules|llm|shadow]
+# register an agent action the board can trigger (prompt via $EDITOR)
+drover action add --name fix-ci --on github.pull_request.merged \
+  --repo acme/api --target ~/src/acme-api --mode acceptEdits
 
-# react to board changes live
-drover daemon --project <board> [--verbose]
+# sense GitHub + the board and drive the loop (push by default; --source poll)
+drover watch --repo acme/api --project <board> --agents 2 \
+  --seen ~/.local/state/drover/seen --provenance ~/.local/state/drover/prov.jsonl
 
-# fire an allowlisted named action
-drover run fix-ci --arg repo=acme/api --arg task="fix the failing run" [--yes]
+# fire an allowlisted named command directly
+drover run fix-ci --arg repo=acme/api --arg task="fix the failing run" --yes
 ```
+
+`drover action list|edit|rm` manage the registry; edits take effect on the next
+event without restarting `watch` (the registry reloads per event).
 
 ## design principles
 
 - **Never exec strings from the board.** The synced, hand-editable file is
-  untrusted input. The executor takes action *names* resolved against trusted
-  config — never command bodies from item fields.
+  untrusted input. The executor takes action *names/ids* resolved against
+  trusted config — never command bodies from item fields.
 - **Address items by id, never index.** Indices shift as the board reorders;
   ids never do.
 - **Policy is a pure function of context.** No I/O in `Decide` — table-testable,
-  and an LLM reasoner drops in behind the same interface.
-- **Validate before acting.** Every proposed action — an `AddTask` spec or a
-  `RunAction` name — is checked against a fixed vocabulary before the executor
-  sees it, so a nondeterministic model can't produce something unsafe.
+  and a new policy drops in behind the same interface.
+- **Gate before acting.** An agent runs on event-derived text only after a human
+  flips the task `hold → go`; the executor validates every action against a
+  fixed vocabulary first.
 
 ## non-goals (v1)
 
-- no perception — "sensing" means structured events (git/CI/webhooks/watch).
-- no ML inside drover — adaptation lives in the model; drover keeps clean,
-  queryable history via shepherd.
+- no perception — "sensing" means structured events (GitHub / Sentry / webhooks
+  / board watch).
+- no ML inside drover — the intelligence lives in the agent it invokes; drover
+  keeps clean, queryable history via shepherd.
 - no reimplementation of shepherd's storage — drover never owns the file.
