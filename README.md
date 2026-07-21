@@ -35,17 +35,18 @@ else stays swappable.
 ## quickstart
 
 ```sh
-# 1. teach drover what to do when a PR merges (prompt opens in $EDITOR)
-drover action add --name fix-ci --on github.pull_request.merged \
-  --repo acme/api --target ~/src/acme-api
+# 1. teach drover what to do when a PR merges (interactive: type→subaction,
+#    seeded prompt; sets the repo + target the agent runs in)
+drover action
 
-# 2. sense GitHub + your board, two agents in parallel
-drover watch --repo acme/api --project work --agents 2
+# 2. sense and drive the loop — repos come from the registry, no flags needed
+drover watch
 ```
 
-3. A PR merges → drover parks **one held task** on the `work` board. Open it in
-   shepherd, flip its status `hold → go`, and the agent runs in `~/src/acme-api`,
-   marking the task done from its verdict. Nothing runs until you release it.
+3. A PR merges → drover parks **one held task** on the board. Open it in
+   shepherd, flip its status `hold → go`, and the agent runs in the action's
+   target dir, marking the task done from its verdict — each run logged as a
+   JSON line on stdout. Nothing runs until you release it.
 
 That's the whole loop. `drover doctor` first if you want to prove the boundary
 before wiring anything up.
@@ -217,7 +218,14 @@ drover action
 drover action add --name fix-ci --on github.pull_request.merged \
   --repo acme/api --target ~/src/acme-api --mode acceptEdits
 
-# sense GitHub + the board and drive the loop (push by default; --source poll)
+# sense and drive the loop — no flags needed; repos are derived from the
+# registry (every github.* action's repo, with its own base/source/interval)
+drover watch
+
+# tail the per-agent-run trace only (stdout), pretty-printed
+drover watch 2>/dev/null | jq -c
+
+# overrides: pin a repo, board, parallelism, and tee the trace to a file
 drover watch --repo acme/api --project <board> --agents 2 \
   --seen ~/.local/state/drover/seen --provenance ~/.local/state/drover/prov.jsonl
 
@@ -230,6 +238,17 @@ and subaction, and the prompt field is seeded with a sensible default you edit.
 It also lists, views, edits and deletes existing actions. `drover action
 list|edit|rm` are the scriptable equivalents; edits take effect on the next event
 without restarting `watch` (the registry reloads per event).
+
+`drover watch` needs no flags: it senses every repo named by a `github.*` action
+(each carrying its own `base`/`source`/`interval`) plus the board, so the
+registry alone defines what runs. `--repo` overrides with an explicit target.
+
+Two output streams while watching keep machine trace and human log apart:
+
+- **stdout** — the structured trace: one JSON record per agent run
+  (`at`, `action`, `task`, `target`, `status`, `summary`, `outcome`). Always on;
+  pipe it to `jq`, or tee it to a file with `--provenance`.
+- **stderr** — the operational log: sensing, seeding, parking, errors.
 
 ## design principles
 

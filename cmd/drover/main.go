@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -85,7 +86,9 @@ watch:  (needs no flags — repos are derived from the registry)
   --source forward|poll   GitHub sense mode (default forward)
   --agents <n>            agent runs allowed in parallel (default 1)
   --seen <file>           persist handled event ids across restarts
-  --provenance <file>     append a JSON record per agent run
+  --provenance <file>     also tee the per-agent-run JSON trace to a file
+
+stdout carries the structured per-agent-run JSON trace; stderr the operational log.
   --registry <path>       action registry (default ~/.config/drover/actions.toml)
 
 action:
@@ -114,7 +117,7 @@ func watch(ctx context.Context, argv []string) error {
 	interval := fs.Duration("interval", time.Minute, "GitHub poll interval (poll mode)")
 	seenPath := fs.String("seen", "", "file recording handled event ids (survives restarts)")
 	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
-	provPath := fs.String("provenance", "", "append a JSON provenance record per agent run to this file")
+	provPath := fs.String("provenance", "", "also append the per-agent-run JSON records to this file (they always stream to stdout)")
 	agents := fs.Int("agents", 1, "number of agent runs to allow in parallel")
 	fs.Parse(argv)
 
@@ -127,13 +130,17 @@ func watch(ctx context.Context, argv []string) error {
 		return err
 	}
 
-	var prov *os.File
+	// Provenance is the daemon's structured trace: one JSON record per agent run.
+	// In watch it always streams to stdout (stderr carries the operational log),
+	// and additionally to --provenance file when given.
+	var provW io.Writer = os.Stdout
 	if *provPath != "" {
-		prov, err = os.OpenFile(*provPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(*provPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
 		}
-		defer prov.Close()
+		defer f.Close()
+		provW = io.MultiWriter(os.Stdout, f)
 	}
 
 	var seen source.Seen
@@ -192,7 +199,7 @@ func watch(ctx context.Context, argv []string) error {
 	// One locked store shared by the assembler, the store executor and the agent
 	// workers so concurrent shepherd calls (file-locked) never overlap.
 	st := &store.Locking{Store: store.ShepherdStore{Project: *project}}
-	ae := &exec.AgentExecutor{Registry: reg, Store: st, Provenance: prov, Timeout: 20 * time.Minute, Concurrency: *agents, Logf: logger.Printf}
+	ae := &exec.AgentExecutor{Registry: reg, Store: st, Provenance: provW, Timeout: 20 * time.Minute, Concurrency: *agents, Logf: logger.Printf}
 	ae.Start(ctx)
 
 	// The board watch is always on; the GitHub sources (0..N) fan in beside it.
