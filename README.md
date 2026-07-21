@@ -1,10 +1,12 @@
-<div align="center">
-  <img src="assets/drover.png" alt="drover" width="220">
-
-  # drover
-
-  > drives the flock the shepherd tends.
-</div>
+<table>
+  <tr>
+    <td valign="top"><img src="assets/drover.png" alt="drover" width="120"></td>
+    <td valign="top">
+      <h1>drover</h1>
+      <em>drives the flock the shepherd tends.</em>
+    </td>
+  </tr>
+</table>
 
 drover is the sense → assemble-context → act loop **around**
 [shepherd](https://github.com/jwarykowski/shepherd). shepherd stays the dumb,
