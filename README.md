@@ -1,12 +1,13 @@
-<table>
-  <tr>
-    <td valign="top"><img src="assets/drover.png" alt="drover" width="120"></td>
-    <td valign="top">
-      <h1>drover</h1>
-      <em>drives the flock the shepherd tends.</em>
-    </td>
-  </tr>
-</table>
+<table width="100%">
+<tr>
+<td valign="top" width="140">
+<img src="assets/drover.png" alt="drover" width="120">
+</td>
+<td valign="top">
+
+# 🐕 drover
+
+> drives the flock the shepherd tends.
 
 drover is the sense → assemble-context → act loop **around**
 [shepherd](https://github.com/jwarykowski/shepherd). shepherd stays the dumb,
@@ -14,6 +15,10 @@ safe blackboard that owns the todo file; drover senses events, reads the
 relevant slice of the board, decides, and — when allowed — acts. **It only ever
 speaks shepherd's CLI, never the file.** Keep that line clean and everything
 else stays swappable.
+
+</td>
+</tr>
+</table>
 
 ## status
 
