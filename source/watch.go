@@ -24,7 +24,7 @@ type WatchSource struct {
 }
 
 // watchLine is one NDJSON record from `shepherd watch`: a change (added/updated/
-// removed) carries item; the initial snapshot carries items.
+// removed/archived) carries item; the initial snapshot carries items.
 type watchLine struct {
 	Type  string      `json:"type"`
 	Item  loop.Item   `json:"item"`
@@ -113,19 +113,39 @@ func scan(ctx context.Context, r io.Reader, out chan<- loop.Event, logf func(str
 		}
 		if ln.Type == "snapshot" {
 			logf("watch snapshot: %d item(s)", len(ln.Items))
+			// Re-drive agentic items from the snapshot so a release that landed
+			// while the stream was down (or before startup) isn't lost — the
+			// snapshot is the only carrier of current state after a reconnect.
+			// Dispatcher's live-status check makes replaying an already-claimed
+			// task a no-op, so this is safe to fire every reconnect.
+			for _, it := range ln.Items {
+				if !it.Agentic {
+					continue
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case out <- boardEvent("updated", it):
+				}
+			}
 			continue
-		}
-		e := loop.Event{
-			Kind:    "board." + ln.Type,
-			Source:  "shepherd.watch",
-			Payload: map[string]any{"item": ln.Item},
-			At:      time.Now(),
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case out <- e:
+		case out <- boardEvent(ln.Type, ln.Item):
 		}
 	}
 	return sc.Err()
+}
+
+// boardEvent wraps a shepherd item change as a loop event.
+func boardEvent(kind string, it loop.Item) loop.Event {
+	return loop.Event{
+		ID:     "board:" + kind + ":" + it.ID,
+		Type:   "board." + kind,
+		Source: "shepherd.watch",
+		Data:   loop.BoardChange{Item: it},
+		At:     time.Now(),
+	}
 }

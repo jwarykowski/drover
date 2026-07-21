@@ -10,16 +10,41 @@ import (
 	"time"
 )
 
-// Event is something that happened worth reacting to: a CI failure, a commit, a
-// webhook. Sensing means structured events, not perception.
+// Event is something that happened worth reacting to: a merge, an issue, a CI
+// failure. Sensing means structured events, not perception. The envelope is
+// CloudEvents-shaped so policies match on Type and dedup on ID.
 type Event struct {
-	Kind    string
-	Source  string
-	Payload map[string]any
-	At      time.Time
+	ID     string  // stable per logical event — the dedup key
+	Type   string  // hierarchical, e.g. "github.pull_request.merged", "board.updated"
+	Source string  // instance identity, e.g. "github/acme/api"
+	Data   Payload // typed, source-specific (see the Payload impls below)
+	At     time.Time
 }
 
-// Item mirrors a shepherd item as emitted by `shepherd list --json` (0.15.0).
+// Payload is the typed body of an Event — a sealed sum type so policies switch
+// on the concrete shape instead of digging in a map. Sources normalise vendor
+// JSON into these at the edge; a policy never sees raw gh/Sentry shapes.
+type Payload interface{ isPayload() }
+
+// Signal is the common "something happened upstream, maybe park a task" shape
+// every ingress source normalises to. Extra holds source-specific bits (labels,
+// sha, level) that only an escape-hatch policy reads.
+type Signal struct {
+	Repo  string
+	Title string
+	URL   string
+	Key   string // stable per-resource key, feeds the Event ID
+	Extra map[string]any
+}
+
+// BoardChange carries a shepherd item that changed — emitted by the watch
+// stream, consumed by the release policy.
+type BoardChange struct{ Item Item }
+
+func (Signal) isPayload()      {}
+func (BoardChange) isPayload() {}
+
+// Item mirrors a shepherd item as emitted by `shepherd list --json`.
 // ID is stable across board reorders; Index is not, so mutations address ID.
 type Item struct {
 	ID        string `json:"id"`
@@ -33,6 +58,8 @@ type Item struct {
 	Due       string `json:"due,omitempty"`
 	Link      string `json:"link,omitempty"`
 	Status    string `json:"status,omitempty"`
+	Agentic   bool   `json:"agentic,omitempty"` // task raised and driven by drover
+	Action    string `json:"action,omitempty"`  // opaque allowlist action to fire on release
 	Note      string `json:"note,omitempty"`
 }
 
@@ -49,6 +76,9 @@ type Spec struct {
 	Text     string
 	Category string
 	Priority string // H, M or L
+	Status   string // named status, e.g. "hold"; empty means default/open
+	Agentic  bool   // mark the task agent-driven (shepherd's `agentic` flag)
+	Action   string // opaque action name the agent fires on release (shepherd's `action:`)
 	Due      string
 	Link     string
 	Note     string
@@ -75,6 +105,29 @@ type RunAction struct {
 
 func (RunAction) isAction() {}
 
+// SetStatus transitions an existing item by id — the loop's way to close or
+// advance a task it created, not just spawn new ones. "done" is terminal; any
+// other value sets a named status (e.g. "running").
+type SetStatus struct {
+	ID     string
+	Status string
+}
+
+func (SetStatus) isAction() {}
+
+// RunAgent fires an agent action from drover's trusted registry. The board
+// references the action by ActionID (a registry id) only — the prompt, target
+// and permission mode live in the registry, never in a board field. The
+// executor resolves the id, runs the agent, and reconciles TaskID from the
+// agent's structured verdict.
+type RunAgent struct {
+	ActionID string            // registry action id resolved by the executor
+	Args     map[string]string // event context substituted into the wrapping prompt
+	TaskID   string            // shepherd item to reconcile from the verdict
+}
+
+func (RunAgent) isAction() {}
+
 // Context is the bundle handed to Policy.Decide. Phase 0+1 fills Event and Board
 // only; Profile, Similar, History and a real Tenant are later context tiers and
 // stay zero-valued for now.
@@ -84,7 +137,7 @@ type Context struct {
 	Tenant string // scopes retrieval once the later tiers exist; empty in P0+1
 }
 
-// Source senses events. GitSource is the Phase 1 batch implementation.
+// Source senses events and streams them until its context is cancelled.
 type Source interface {
 	Events(ctx context.Context) <-chan Event
 }
@@ -95,6 +148,8 @@ type Store interface {
 	List(ctx context.Context, f Filter) ([]Item, error)
 	Add(ctx context.Context, s Spec) (Item, error)
 	SetStatus(ctx context.Context, id, status string) error
+	Note(ctx context.Context, id, text string) error // attach a note to an item by id
+	Archive(ctx context.Context, id string) error    // move an item off the live board (board emits a terminal "archived" event)
 }
 
 // Assembler turns an event into the Context a policy reasons over. The Phase 0+1

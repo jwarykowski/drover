@@ -4,7 +4,7 @@
 //
 //	go test -tags integration ./store/
 //
-// Requires `shepherd` (>= 0.15.0) on PATH. Uses a throwaway board and deletes it
+// Requires `shepherd` on PATH. Uses a throwaway board and deletes it
 // afterwards, so it never touches a real one.
 package store
 

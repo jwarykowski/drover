@@ -72,13 +72,6 @@ func (s ShepherdStore) Add(ctx context.Context, spec loop.Spec) (loop.Item, erro
 	return it, nil
 }
 
-// Schema returns shepherd's item JSON Schema (`shepherd schema`), for handing to
-// an LLM policy. Best-effort: older shepherds without the verb return an error
-// the caller can ignore.
-func (s ShepherdStore) Schema(ctx context.Context) ([]byte, error) {
-	return s.run(ctx, "schema")
-}
-
 // SetStatus marks an item done/undone, or sets a named status, addressing by id.
 func (s ShepherdStore) SetStatus(ctx context.Context, id, status string) error {
 	var args []string
@@ -91,6 +84,21 @@ func (s ShepherdStore) SetStatus(ctx context.Context, id, status string) error {
 		args = []string{"edit", id, "status:" + status, "--json"}
 	}
 	_, err := s.run(ctx, args...)
+	return err
+}
+
+// Note attaches a note to an item by id (`edit <id> note:<text>`). note: takes
+// the rest of the line, so text needn't be escaped here.
+func (s ShepherdStore) Note(ctx context.Context, id, text string) error {
+	_, err := s.run(ctx, "edit", id, "note:"+text, "--json")
+	return err
+}
+
+// Archive moves an item off the live board into shepherd's archive
+// (`archive <id>`). shepherd emits it on `watch` as a terminal "archived" event,
+// distinct from a plain removal.
+func (s ShepherdStore) Archive(ctx context.Context, id string) error {
+	_, err := s.run(ctx, "archive", id, "--json")
 	return err
 }
 
@@ -154,6 +162,15 @@ func buildAddText(s loop.Spec) string {
 		parts = append(parts, "!m")
 	case "L":
 		parts = append(parts, "!l")
+	}
+	if s.Status != "" {
+		parts = append(parts, "status:"+s.Status)
+	}
+	if s.Agentic {
+		parts = append(parts, "agentic")
+	}
+	if s.Action != "" {
+		parts = append(parts, "action:"+s.Action)
 	}
 	if s.Due != "" {
 		parts = append(parts, "due:"+s.Due)

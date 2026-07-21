@@ -14,7 +14,10 @@ func (s stubPolicy) Decide(context.Context, Context) []Action { return s.actions
 // recorder captures what the executor was handed.
 type recorder struct{ got []Action }
 
-func (r *recorder) Apply(_ context.Context, a []Action) error { r.got = append(r.got, a...); return nil }
+func (r *recorder) Apply(_ context.Context, a []Action) error {
+	r.got = append(r.got, a...)
+	return nil
+}
 
 // passAssembler wraps an event into a bare Context.
 type passAssembler struct{ board []Item }
@@ -30,7 +33,7 @@ func TestLoopRun(t *testing.T) {
 		Policy:    stubPolicy{actions: []Action{AddTask{Spec{Text: "x"}}}},
 		Executor:  rec,
 	}
-	if err := l.Run(context.Background(), Event{Kind: "ci.failed"}); err != nil {
+	if err := l.Run(context.Background(), Event{Type: "ci.failed"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.got) != 1 {
@@ -41,7 +44,7 @@ func TestLoopRun(t *testing.T) {
 func TestLoopRunNoActionsSkipsExecutor(t *testing.T) {
 	rec := &recorder{}
 	l := Loop{Assembler: passAssembler{}, Policy: stubPolicy{}, Executor: rec}
-	if err := l.Run(context.Background(), Event{Kind: "unknown"}); err != nil {
+	if err := l.Run(context.Background(), Event{Type: "unknown"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.got) != 0 {
