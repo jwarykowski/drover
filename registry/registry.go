@@ -21,14 +21,20 @@ import (
 )
 
 // Action is one row: on this event, run an agent in target with this prompt.
+// Base/Source/Interval are github-sensing knobs, so `drover watch` needs no
+// flags — each github.* action carrying a repo also carries how to watch it
+// (empty fields fall back to the watch defaults).
 type Action struct {
-	ID     string `toml:"id"`             // stable key the board references
-	Name   string `toml:"name"`           // friendly label, editable
-	On     string `toml:"on"`             // event Type to match
-	Repo   string `toml:"repo,omitempty"` // optional source filter (owner/name)
-	Target string `toml:"target"`         // cwd the agent runs in
-	Mode   string `toml:"mode"`           // claude permission mode
-	Do     string `toml:"do"`             // the prompt body
+	ID       string `toml:"id"`                 // stable key the board references
+	Name     string `toml:"name"`               // friendly label, editable
+	On       string `toml:"on"`                 // event Type to match
+	Repo     string `toml:"repo,omitempty"`     // optional source filter (owner/name)
+	Base     string `toml:"base,omitempty"`     // github poll-mode branch; empty = master
+	Source   string `toml:"source,omitempty"`   // github sense: forward|poll; empty = forward
+	Interval string `toml:"interval,omitempty"` // github poll interval (e.g. "60s"); empty = 60s
+	Target   string `toml:"target"`             // cwd the agent runs in
+	Mode     string `toml:"mode"`               // claude permission mode
+	Do       string `toml:"do"`                 // the prompt body
 }
 
 // Registry is the loaded action set plus the path it came from. mu guards
@@ -78,6 +84,15 @@ var KnownEventTypes = []string{
 
 // ValidModes are the claude permission modes an action may request.
 var ValidModes = []string{"default", "acceptEdits", "plan", "bypassPermissions"}
+
+// AutoModes are the modes suitable for unattended runs: they never wait on an
+// interactive permission prompt. "default"/"plan" are excluded because headless
+// they either cannot prompt (so tools are denied) or make no changes at all.
+// The first entry is the authoring default in the TUI.
+var AutoModes = []string{"bypassPermissions", "acceptEdits"}
+
+// ValidSources are the github sense modes an action may request.
+var ValidSources = []string{"forward", "poll"}
 
 var ErrNotFound = errors.New("registry: action not found")
 

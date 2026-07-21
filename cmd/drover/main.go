@@ -8,13 +8,16 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	osexec "os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/x/term"
 	dctx "github.com/jwarykowski/drover/context"
 	"github.com/jwarykowski/drover/exec"
 	"github.com/jwarykowski/drover/loop"
@@ -22,6 +25,7 @@ import (
 	"github.com/jwarykowski/drover/registry"
 	"github.com/jwarykowski/drover/source"
 	"github.com/jwarykowski/drover/store"
+	"github.com/jwarykowski/drover/tui"
 )
 
 func main() {
@@ -40,6 +44,10 @@ func main() {
 		err = watch(ctx, os.Args[2:])
 	case "action":
 		err = actionCmd(os.Args[2:])
+	case "version", "--version", "-v":
+		fmt.Println("drover", version())
+	case "help", "--help", "-h":
+		fmt.Println(usageText)
 	default:
 		usage()
 		os.Exit(2)
@@ -50,9 +58,46 @@ func main() {
 	}
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, "usage: drover <watch|action|run|doctor> [flags]")
-}
+func usage() { fmt.Fprintln(os.Stderr, usageText) }
+
+// Version is drover's version, the single source of truth. Bump on release;
+// there's no separate manifest to drift against (unlike shepherd's plugin file).
+const Version = "0.1.0"
+
+func version() string { return Version }
+
+const usageText = `drover — the sense→assemble→act loop around a shepherd board
+
+Usage:
+  drover <command> [flags]
+
+Commands:
+  watch      sense GitHub + the board and drive the loop
+  action     author the trusted action registry (opens a TUI)
+  run        fire an allowlisted command directly
+  doctor     prove the shepherd boundary (read the board, add a probe)
+  version    print the version and exit
+  help       print this help
+
+watch:  (needs no flags — repos are derived from the registry)
+  --repo owner/name       repo to watch (optional; else every repo named by a github.* action)
+  --project <board>       shepherd board to park tasks on
+  --source forward|poll   GitHub sense mode (default forward)
+  --agents <n>            agent runs allowed in parallel (default 1)
+  --seen <file>           persist handled event ids across restarts
+  --provenance <file>     append a JSON record per agent run
+  --registry <path>       action registry (default ~/.config/drover/actions.toml)
+
+action:
+  (bare)                  interactive TUI: create/view/edit/delete actions
+  add|list|edit|rm        scriptable registry management
+
+run <name>:
+  --arg key=value         substitute into the allowlisted command (repeatable)
+  --yes                   skip the confirm prompt
+  --config <path>         allowlist file (default config/config.toml)
+
+Runtime needs shepherd, gh and claude on PATH.`
 
 // watch runs the closed loop over all configured sources: sense GitHub (+ the
 // board), match each event against the trusted registry to park a held agentic
@@ -61,7 +106,7 @@ func usage() {
 // webhook forward`) by default, poll as a fallback; both dedup on event id.
 func watch(ctx context.Context, argv []string) error {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
-	repo := fs.String("repo", "", "GitHub repo to watch, owner/name (required)")
+	repo := fs.String("repo", "", "GitHub repo to watch, owner/name (optional; else derived from the registry)")
 	base := fs.String("base", "master", "branch whose merges are sensed (poll mode)")
 	project := fs.String("project", "", "shepherd board to park tasks on")
 	sourceMode := fs.String("source", "forward", "GitHub sense: forward (gh webhook forward) | poll")
@@ -72,10 +117,6 @@ func watch(ctx context.Context, argv []string) error {
 	provPath := fs.String("provenance", "", "append a JSON provenance record per agent run to this file")
 	agents := fs.Int("agents", 1, "number of agent runs to allow in parallel")
 	fs.Parse(argv)
-
-	if *repo == "" {
-		return fmt.Errorf("watch: --repo owner/name is required")
-	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -106,24 +147,46 @@ func watch(ctx context.Context, argv []string) error {
 		seen = source.NewMemSeen()
 	}
 
-	var ghSrc loop.Source
-	switch *sourceMode {
-	case "poll":
-		gh := source.GitHubSource{Repo: *repo, Base: *base, Interval: *interval, Logf: logger.Printf}
-		if fseen, ok := seen.(*source.FileSeen); ok && fseen.Empty() {
-			if ids, err := gh.SeedIDs(ctx); err == nil {
-				for _, id := range ids {
-					_ = seen.Add(id)
-				}
-				logger.Printf("seeded %d merged PR(s) at head; not firing history", len(ids))
-			} else {
-				logger.Printf("seed: %v", err)
-			}
+	// GitHub sensing is registry-driven: each github.* action naming a repo
+	// contributes a watch carrying that action's base/source/interval (empty
+	// fields fall back to the flag defaults), so `drover watch` needs no flags.
+	// An explicit --repo overrides with the flags.
+	var watches []repoWatch
+	if *repo != "" {
+		watches = []repoWatch{{repo: *repo, base: *base, source: *sourceMode, interval: *interval}}
+	} else {
+		watches = githubWatches(reg, *base, *sourceMode, *interval, logger.Printf)
+		if bare := agnosticGithubActions(reg); len(bare) > 0 {
+			logger.Printf("%d github action(s) have no repo filter, so can't be auto-watched — add repo: to them or pass --repo (%s)", len(bare), strings.Join(bare, ", "))
 		}
-		ghSrc = source.Dedup{Src: gh, Seen: seen, Logf: logger.Printf}
-	default: // forward
-		wh := source.WebhookSource{Repo: *repo, Addr: *addr, Forward: true, Logf: logger.Printf}
-		ghSrc = source.Dedup{Src: wh, Seen: seen, Logf: logger.Printf}
+	}
+
+	// Cold-start seeding is one-time per FileSeen; capture emptiness once, before
+	// any repo seeds and flips it non-empty.
+	firstRun := false
+	if fseen, ok := seen.(*source.FileSeen); ok && fseen.Empty() {
+		firstRun = true
+	}
+
+	ghSrcs := make([]loop.Source, 0, len(watches))
+	for i, w := range watches {
+		if w.source == "poll" {
+			gh := source.GitHubSource{Repo: w.repo, Base: w.base, Interval: w.interval, Logf: logger.Printf}
+			if firstRun {
+				if ids, err := gh.SeedIDs(ctx); err == nil {
+					for _, id := range ids {
+						_ = seen.Add(id)
+					}
+					logger.Printf("seeded %d merged PR(s) at head for %s; not firing history", len(ids), w.repo)
+				} else {
+					logger.Printf("seed %s: %v", w.repo, err)
+				}
+			}
+			ghSrcs = append(ghSrcs, source.Dedup{Src: gh, Seen: seen, Logf: logger.Printf})
+		} else { // forward
+			wh := source.WebhookSource{Repo: w.repo, Addr: addrFor(*addr, i), Forward: true, Logf: logger.Printf}
+			ghSrcs = append(ghSrcs, source.Dedup{Src: wh, Seen: seen, Logf: logger.Printf})
+		}
 	}
 
 	// One locked store shared by the assembler, the store executor and the agent
@@ -132,7 +195,8 @@ func watch(ctx context.Context, argv []string) error {
 	ae := &exec.AgentExecutor{Registry: reg, Store: st, Provenance: prov, Timeout: 20 * time.Minute, Concurrency: *agents, Logf: logger.Printf}
 	ae.Start(ctx)
 
-	src := source.Merge(ghSrc, source.WatchSource{Project: *project, Logf: logger.Printf})
+	// The board watch is always on; the GitHub sources (0..N) fan in beside it.
+	src := source.Merge(append(ghSrcs, source.WatchSource{Project: *project, Logf: logger.Printf})...)
 	l := loop.Loop{
 		Assembler: dctx.WorkingContext{Store: st},
 		Policy: policy.PolicyRouter{
@@ -148,7 +212,15 @@ func watch(ctx context.Context, argv []string) error {
 		},
 	}
 
-	logger.Printf("watching %s via %s; parking on board %q, %d action(s) registered, %d agent(s)", *repo, *sourceMode, boardName(*project), len(reg.Actions), *agents)
+	watched := "(board only)"
+	if len(watches) > 0 {
+		names := make([]string, len(watches))
+		for i, w := range watches {
+			names[i] = w.repo
+		}
+		watched = strings.Join(names, ", ")
+	}
+	logger.Printf("watching board %q + repos [%s] via %s; %d action(s) registered, %d agent(s)", boardName(*project), watched, *sourceMode, len(reg.Actions), *agents)
 	for e := range src.Events(ctx) {
 		// Reload the registry each event so `drover action add|edit|rm` take
 		// effect without restarting the daemon. reg is shared (guarded by its own
@@ -169,8 +241,10 @@ func watch(ctx context.Context, argv []string) error {
 // add|list|edit|rm`. This is the only writer of the registry the board
 // references, so it is where events bind to what an agent does.
 func actionCmd(argv []string) error {
-	if len(argv) == 0 {
-		return fmt.Errorf("action: missing subcommand (add|list|edit|rm)")
+	// Bare `drover action` (or with only flags) opens the interactive TUI; the
+	// flag verbs stay for scripting.
+	if len(argv) == 0 || strings.HasPrefix(argv[0], "-") {
+		return actionTUI(argv)
 	}
 	sub, rest := argv[0], argv[1:]
 	switch sub {
@@ -185,6 +259,19 @@ func actionCmd(argv []string) error {
 	default:
 		return fmt.Errorf("action: unknown subcommand %q", sub)
 	}
+}
+
+// actionTUI opens the interactive registry manager. It needs a terminal; when
+// stdin isn't one (piped/CI), it prints the scriptable usage instead of crashing.
+func actionTUI(argv []string) error {
+	fs := flag.NewFlagSet("action", flag.ExitOnError)
+	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	fs.Parse(argv)
+	if !term.IsTerminal(os.Stdin.Fd()) {
+		fmt.Fprintln(os.Stderr, "usage: drover action <add|list|edit|rm> [flags]  (bare `drover action` opens the TUI on a terminal)")
+		return fmt.Errorf("action: not a terminal")
+	}
+	return tui.Run(*regPath)
 }
 
 func actionAdd(argv []string) error {
@@ -447,6 +534,81 @@ func doctor(ctx context.Context, argv []string) error {
 	}
 	fmt.Printf("added probe: [%s] %s\n", added.ID, added.Text)
 	return nil
+}
+
+// repoWatch is one GitHub sense target derived from the registry (or --repo).
+type repoWatch struct {
+	repo     string
+	base     string
+	source   string
+	interval time.Duration
+}
+
+// githubWatches builds one watch per distinct repo named by a github.* action,
+// carrying that action's base/source/interval — the first action naming a repo
+// wins, and empty fields fall back to the daemon defaults. This is what lets
+// `drover watch` run with no flags: the registry defines what and how to sense.
+func githubWatches(reg *registry.Registry, defBase, defSource string, defInterval time.Duration, logf func(string, ...any)) []repoWatch {
+	var out []repoWatch
+	seen := map[string]bool{}
+	for _, a := range reg.Actions {
+		if !strings.HasPrefix(a.On, "github.") || a.Repo == "" || seen[a.Repo] {
+			continue
+		}
+		seen[a.Repo] = true
+		w := repoWatch{
+			repo:     a.Repo,
+			base:     firstNonEmpty(a.Base, defBase),
+			source:   firstNonEmpty(a.Source, defSource),
+			interval: defInterval,
+		}
+		if a.Interval != "" {
+			if d, err := time.ParseDuration(a.Interval); err == nil {
+				w.interval = d
+			} else if logf != nil {
+				logf("action %s: bad interval %q, using default: %v", a.Name, a.Interval, err)
+			}
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// agnosticGithubActions names github.* actions with no repo filter. They match
+// any repo, so there's no concrete repo to poll/forward — auto-watch skips them.
+func agnosticGithubActions(reg *registry.Registry) []string {
+	var out []string
+	for _, a := range reg.Actions {
+		if strings.HasPrefix(a.On, "github.") && a.Repo == "" {
+			out = append(out, a.Name)
+		}
+	}
+	return out
+}
+
+// addrFor gives each forwarded repo its own local port (base + i) so multiple
+// `gh webhook forward` receivers don't collide on one bind. Falls back to base
+// if it can't parse a host:port.
+func addrFor(base string, i int) string {
+	if i == 0 {
+		return base
+	}
+	host, port, err := net.SplitHostPort(base)
+	if err != nil {
+		return base
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return base
+	}
+	return net.JoinHostPort(host, strconv.Itoa(p+i))
 }
 
 func boardName(p string) string {

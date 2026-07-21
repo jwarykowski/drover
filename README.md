@@ -210,7 +210,10 @@ needs `shepherd`; watching GitHub needs `gh`; agent runs shell `claude`).
 # prove the boundary: read the board, add a throwaway
 drover doctor --project <board>
 
-# register an agent action the board can trigger (prompt via $EDITOR)
+# author an agent action interactively (guided type→subaction, seeded prompt)
+drover action
+
+# …or scripted: register an action the board can trigger (prompt via $EDITOR)
 drover action add --name fix-ci --on github.pull_request.merged \
   --repo acme/api --target ~/src/acme-api --mode acceptEdits
 
@@ -222,8 +225,11 @@ drover watch --repo acme/api --project <board> --agents 2 \
 drover run fix-ci --arg repo=acme/api --arg task="fix the failing run" --yes
 ```
 
-`drover action list|edit|rm` manage the registry; edits take effect on the next
-event without restarting `watch` (the registry reloads per event).
+Bare `drover action` opens an interactive TUI — pick a type (github/sentry/board)
+and subaction, and the prompt field is seeded with a sensible default you edit.
+It also lists, views, edits and deletes existing actions. `drover action
+list|edit|rm` are the scriptable equivalents; edits take effect on the next event
+without restarting `watch` (the registry reloads per event).
 
 ## design principles
 
