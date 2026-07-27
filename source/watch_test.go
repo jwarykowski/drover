@@ -17,7 +17,7 @@ func TestScanEmitsChangesSkipsSnapshot(t *testing.T) {
 	}, "\n")
 
 	out := make(chan loop.Event, 8)
-	if err := scan(context.Background(), strings.NewReader(stream), out, nil); err != nil {
+	if err := scan(context.Background(), strings.NewReader(stream), out, "work", nil); err != nil {
 		t.Fatal(err)
 	}
 	close(out)
@@ -36,6 +36,9 @@ func TestScanEmitsChangesSkipsSnapshot(t *testing.T) {
 	if !ok || bc.Item.ID != "2" || bc.Item.Category != "ci" {
 		t.Errorf("added payload lost the item: %+v", got[0].Data)
 	}
+	if bc.Board != "work" {
+		t.Errorf("event not tagged with the watched board: %q", bc.Board)
+	}
 }
 
 func TestScanReplaysAgenticSnapshotItems(t *testing.T) {
@@ -43,7 +46,7 @@ func TestScanReplaysAgenticSnapshotItems(t *testing.T) {
 		`{"type":"snapshot","items":[{"id":"1","text":"plain"},{"id":"2","text":"held","agentic":true,"status":"go","action":"a1"}]}`,
 	}, "\n")
 	out := make(chan loop.Event, 8)
-	if err := scan(context.Background(), strings.NewReader(stream), out, nil); err != nil {
+	if err := scan(context.Background(), strings.NewReader(stream), out, "work", nil); err != nil {
 		t.Fatal(err)
 	}
 	close(out)
@@ -67,7 +70,7 @@ func TestScanStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	out := make(chan loop.Event) // no reader
-	err := scan(ctx, strings.NewReader(`{"type":"added","item":{"id":"1"}}`), out, nil)
+	err := scan(ctx, strings.NewReader(`{"type":"added","item":{"id":"1"}}`), out, "", nil)
 	if err == nil {
 		t.Error("want context error on cancelled send, got nil")
 	}

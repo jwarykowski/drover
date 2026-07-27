@@ -17,7 +17,7 @@ import (
 // consumer pauses the reader, which pauses shepherd's writes.
 type WatchSource struct {
 	Bin      string        // shepherd binary; defaults to "shepherd"
-	Project  string        // board to watch; empty means the default
+	Board    string        // board to watch; empty means the default
 	Interval time.Duration // poll interval passed to shepherd watch; 0 uses its default
 	Backoff  time.Duration // wait before reconnecting; 0 defaults to 1s
 	Logf     func(string, ...any)
@@ -51,6 +51,16 @@ func (s WatchSource) logf(format string, a ...any) {
 	}
 }
 
+// boardID is the concrete name of the watched board, resolving the empty
+// default to "default" — so a triggered run on the default board is tagged with
+// a real id, distinct from a board-less (github/sentry) run.
+func (s WatchSource) boardID() string {
+	if s.Board == "" {
+		return "default"
+	}
+	return s.Board
+}
+
 // Events runs the watch loop until ctx is cancelled, reconnecting on drop.
 func (s WatchSource) Events(ctx context.Context) <-chan loop.Event {
 	out := make(chan loop.Event) // unbuffered: the consumer paces the producer
@@ -79,8 +89,8 @@ func (s WatchSource) stream(ctx context.Context, out chan<- loop.Event) error {
 	if s.Interval > 0 {
 		args = append(args, "--interval", s.Interval.String())
 	}
-	if s.Project != "" {
-		args = append(args, "--project", s.Project)
+	if s.Board != "" {
+		args = append(args, "--board", s.Board)
 	}
 	cmd := exec.CommandContext(ctx, s.bin(), args...)
 	stdout, err := cmd.StdoutPipe()
@@ -90,7 +100,7 @@ func (s WatchSource) stream(ctx context.Context, out chan<- loop.Event) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	scanErr := scan(ctx, stdout, out, s.logf)
+	scanErr := scan(ctx, stdout, out, s.boardID(), s.logf)
 	// CommandContext kills the process on ctx cancel; reap it either way.
 	_ = cmd.Wait()
 	return scanErr
@@ -99,7 +109,7 @@ func (s WatchSource) stream(ctx context.Context, out chan<- loop.Event) error {
 // scan reads NDJSON lines from r and emits an event per change. Split out from
 // the subprocess so it's unit-tested with a plain reader. The snapshot line is
 // the baseline, not a change, so it's logged and skipped.
-func scan(ctx context.Context, r io.Reader, out chan<- loop.Event, logf func(string, ...any)) error {
+func scan(ctx context.Context, r io.Reader, out chan<- loop.Event, board string, logf func(string, ...any)) error {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
@@ -125,7 +135,7 @@ func scan(ctx context.Context, r io.Reader, out chan<- loop.Event, logf func(str
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case out <- boardEvent("updated", it):
+				case out <- boardEvent("updated", it, board):
 				}
 			}
 			continue
@@ -133,19 +143,20 @@ func scan(ctx context.Context, r io.Reader, out chan<- loop.Event, logf func(str
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case out <- boardEvent(ln.Type, ln.Item):
+		case out <- boardEvent(ln.Type, ln.Item, board):
 		}
 	}
 	return sc.Err()
 }
 
-// boardEvent wraps a shepherd item change as a loop event.
-func boardEvent(kind string, it loop.Item) loop.Event {
+// boardEvent wraps a shepherd item change as a loop event, tagged with the board
+// it came from.
+func boardEvent(kind string, it loop.Item, board string) loop.Event {
 	return loop.Event{
 		ID:     "board:" + kind + ":" + it.ID,
 		Type:   "board." + kind,
 		Source: "shepherd.watch",
-		Data:   loop.BoardChange{Item: it},
+		Data:   loop.BoardChange{Item: it, Board: board},
 		At:     time.Now(),
 	}
 }

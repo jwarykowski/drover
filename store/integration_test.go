@@ -22,8 +22,8 @@ func TestShepherdStoreRoundTrip(t *testing.T) {
 	}
 	const board = "drover-integration"
 	ctx := context.Background()
-	st := ShepherdStore{Project: board}
-	t.Cleanup(func() { _ = exec.Command("shepherd", "project", "delete", board, "--force").Run() })
+	st := ShepherdStore{Board: board}
+	t.Cleanup(func() { _ = exec.Command("shepherd", "board", "delete", board, "--force").Run() })
 
 	added, err := st.Add(ctx, loop.Spec{
 		Text: "integration probe", Category: "ci", Priority: "H",

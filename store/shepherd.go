@@ -20,8 +20,8 @@ var ErrNotFound = errors.New("shepherd: item not found")
 
 // ShepherdStore talks to a real shepherd binary over os/exec.
 type ShepherdStore struct {
-	Bin     string // path or name of the shepherd binary; defaults to "shepherd"
-	Project string // board to act on; empty means the default board
+	Bin   string // path or name of the shepherd binary; defaults to "shepherd"
+	Board string // board to act on; empty means the default board
 }
 
 func (s ShepherdStore) bin() string {
@@ -102,16 +102,64 @@ func (s ShepherdStore) Archive(ctx context.Context, id string) error {
 	return err
 }
 
-// run executes shepherd with the project flag prepended, and maps a --json error
-// envelope on stdout to a typed error.
-func (s ShepherdStore) run(ctx context.Context, args ...string) ([]byte, error) {
-	// shepherd wants flags after the verb ("Flags follow the verb"), so the
-	// project flag trails rather than leading.
-	full := args
-	if s.Project != "" {
-		full = append(full, "--project", s.Project)
+// Board is one board as reported by `shepherd boards --json`.
+type Board struct {
+	Name    string `json:"name"`
+	Open    int    `json:"open"`
+	Total   int    `json:"total"`
+	Current bool   `json:"current"`       // the active board
+	Dir     string `json:"dir,omitempty"` // configured working directory (shepherd)
+}
+
+// BoardDir resolves a board's configured working directory (empty if unset). It
+// reads the boards listing rather than shelling `board dir` so one call
+// serves any board. Used at agent run time to resolve an action's TargetBoard.
+func (s ShepherdStore) BoardDir(ctx context.Context, name string) (string, error) {
+	ps, err := s.Boards(ctx)
+	if err != nil {
+		return "", err
 	}
-	cmd := exec.CommandContext(ctx, s.bin(), full...)
+	for _, p := range ps {
+		if p.Name == name {
+			return p.Dir, nil
+		}
+	}
+	return "", fmt.Errorf("shepherd: no board %q", name)
+}
+
+// Boards lists shepherd's boards. `boards` takes no --board, so it goes
+// through output directly rather than run. Not part of the loop.Store seam — a
+// UI read, not a loop mutation.
+func (s ShepherdStore) Boards(ctx context.Context) ([]Board, error) {
+	out, err := s.output(ctx, "boards", "--json")
+	if err != nil {
+		return nil, err
+	}
+	return decodeBoards(out)
+}
+
+func decodeBoards(b []byte) ([]Board, error) {
+	var ps []Board
+	if err := json.Unmarshal(b, &ps); err != nil {
+		return nil, fmt.Errorf("shepherd boards: %w", err)
+	}
+	return ps, nil
+}
+
+// run executes shepherd with the board flag appended (shepherd wants flags
+// after the verb), then defers to output.
+func (s ShepherdStore) run(ctx context.Context, args ...string) ([]byte, error) {
+	full := args
+	if s.Board != "" {
+		full = append(full, "--board", s.Board)
+	}
+	return s.output(ctx, full...)
+}
+
+// output runs shepherd with args verbatim (no --board injected) and maps a
+// --json error envelope on stdout to a typed error.
+func (s ShepherdStore) output(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, s.bin(), args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	runErr := cmd.Run()

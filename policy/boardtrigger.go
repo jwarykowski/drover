@@ -7,35 +7,31 @@ import (
 	"github.com/jwarykowski/drover/registry"
 )
 
-// BoardTrigger fires a registry action on a board change, matching by event type
-// the way Ingress matches github types. It has NO hold→go human gate, so it is
-// scoped to human-authored items (Agentic==false): an Ingress-parked task carries
-// untrusted upstream text and is fired only by the gated Dispatcher.
+// BoardTrigger turns a shepherd board change into a drover-side run WITHOUT
+// mutating the board. shepherd is a pure trigger source: on a change matching a
+// registry action, BoardTrigger parks an agentic task in drover's OWN store (the
+// FileStore), which the Dispatcher then fires and the agent reconciles back to —
+// never the shepherd item. The human's board item is left exactly as they set it
+// (open/done); drover tracks the run entirely on its side.
 //
-// It handles two lifecycle phases differently:
+// The parked task carries the board item id as Link, so StoreExecutor dedups on
+// it: one active run per (board item, action). A repeat board.updated while the
+// run is in flight is a no-op; a fresh run fires only once the previous one is
+// done (StoreExecutor.taskExists ignores completed tasks).
 //
-//   - Live (board.added / board.updated): the item is still on the board, so
-//     BoardTrigger claims it Running and RunAgent reconciles the verdict back.
-//     Idempotency: the agent's own reconcile writes arrive as more board.updated
-//     events, so it fires only while the item is still OPEN (unclaimed); once
-//     claimed the item no longer qualifies. Fires at most once per open→run.
-//   - Terminal (board.removed / board.archived): the item is off the live board,
-//     so BoardTrigger reads it from the event payload and fires-and-forget — no
-//     claim, no reconcile (empty TaskID). The transition emits once, so no loop.
-//
-// a board.added action ALSO fires on any follow-up todo a fired agent
-// creates (they land as human-authored open items) — a cascade. Prefer
-// board.updated, or don't emit followups from a board.added action.
+// Parked at "hold": the run waits in the dashboard's held lane until a human
+// releases it (hold → go), same gate as Ingress. Board triggers are a queue of
+// suggested runs the operator kicks off manually, not auto-fired.
 type BoardTrigger struct {
 	Registry *registry.Registry
-	Running  string // claim status; defaults to "running"
+	Hold     string // park status; defaults to "hold" (a human releases to "go")
 }
 
-func (p BoardTrigger) running() string {
-	if p.Running == "" {
-		return "running"
+func (p BoardTrigger) hold() string {
+	if p.Hold == "" {
+		return "hold"
 	}
-	return p.Running
+	return p.Hold
 }
 
 func (p BoardTrigger) Decide(_ context.Context, c loop.Context) []loop.Action {
@@ -43,54 +39,21 @@ func (p BoardTrigger) Decide(_ context.Context, c loop.Context) []loop.Action {
 	if !ok || p.Registry == nil {
 		return nil
 	}
-
-	terminal := isTerminal(c.Event.Type)
-	it := b.Item // terminal items are off the live board; use the event payload
-	if !terminal {
-		var ok bool
-		if it, ok = liveItem(c.Board, b.Item.ID); !ok {
-			return nil
-		}
-		// Unclaimed only, so drover's own reconcile writes don't re-fire it.
-		if !openStatus(it.Status) {
-			return nil
-		}
-	}
-	if it.Agentic { // trust boundary: never auto-fire on Ingress-parked text
-		return nil
-	}
+	it := b.Item // the changed item, straight from the watch payload
 	matches := p.Registry.Match(c.Event.Type, "")
 	if len(matches) == 0 {
 		return nil
 	}
-	// first matching action only; multiple board actions of one type
-	// on a single item is a niche we don't need yet.
+	// First matching action only; multiple board actions of one type on a single
+	// item is a niche we don't need yet.
 	a := matches[0]
-	args := map[string]string{"title": it.Text, "url": it.Link, "id": it.ID}
-	if terminal {
-		// Fire-and-forget: empty TaskID tells the executor to skip reconcile.
-		return []loop.Action{loop.RunAgent{ActionID: a.ID, TaskID: "", Args: args}}
-	}
-	return []loop.Action{
-		loop.SetStatus{ID: it.ID, Status: p.running()},
-		loop.RunAgent{ActionID: a.ID, TaskID: it.ID, Args: args},
-	}
-}
-
-// isTerminal reports whether the event is a terminal board transition — the item
-// has left the active board (removed or archived), so there is nothing to claim
-// or reconcile.
-func isTerminal(evType string) bool {
-	return evType == "board.removed" || evType == "board.archived"
-}
-
-// openStatus reports whether an item is unclaimed — not in a drover claim/gate
-// or terminal state. Anything else (empty default, a human label like "todo")
-// is eligible to trigger once.
-func openStatus(s string) bool {
-	switch s {
-	case "hold", "go", "running", "done":
-		return false
-	}
-	return true
+	return []loop.Action{loop.AddTask{Spec: loop.Spec{
+		Text:    it.Text,
+		Agentic: true,     // a drover-owned run, invisible to shepherd
+		Status:  p.hold(), // parked for a human to release (hold → go)
+		Action:  a.ID,     // reference only; the prompt lives in the registry
+		Link:    it.ID,    // dedup key: one active run per (board item, action)
+		Note:    it.Text,  // the agent's "title" context
+		Board:   b.Board,  // origin board, so the dashboard can filter by selection
+	}}}
 }

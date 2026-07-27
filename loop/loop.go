@@ -27,19 +27,20 @@ type Event struct {
 type Payload interface{ isPayload() }
 
 // Signal is the common "something happened upstream, maybe park a task" shape
-// every ingress source normalises to. Extra holds source-specific bits (labels,
-// sha, level) that only an escape-hatch policy reads.
+// every ingress source normalises to.
 type Signal struct {
 	Repo  string
 	Title string
 	URL   string
-	Key   string // stable per-resource key, feeds the Event ID
-	Extra map[string]any
 }
 
 // BoardChange carries a shepherd item that changed — emitted by the watch
-// stream, consumed by the release policy.
-type BoardChange struct{ Item Item }
+// stream, consumed by the release policy. Board is the name of the board it came
+// from (watch is single-board), so a triggered run can be tagged with its origin.
+type BoardChange struct {
+	Item  Item
+	Board string
+}
 
 func (Signal) isPayload()      {}
 func (BoardChange) isPayload() {}
@@ -61,6 +62,7 @@ type Item struct {
 	Agentic   bool   `json:"agentic,omitempty"` // task raised and driven by drover
 	Action    string `json:"action,omitempty"`  // opaque allowlist action to fire on release
 	Note      string `json:"note,omitempty"`
+	Board     string `json:"board,omitempty"` // origin board of a triggered run; empty = not board-scoped (github/sentry)
 }
 
 // Filter narrows a board read to the relevant slice — the "attention" a policy
@@ -82,6 +84,7 @@ type Spec struct {
 	Due      string
 	Link     string
 	Note     string
+	Board    string // origin board of a board-triggered run; empty = not board-scoped
 }
 
 // Action is something a policy decides to do. AddTask is the only Action in
@@ -129,12 +132,10 @@ type RunAgent struct {
 func (RunAgent) isAction() {}
 
 // Context is the bundle handed to Policy.Decide. Phase 0+1 fills Event and Board
-// only; Profile, Similar, History and a real Tenant are later context tiers and
-// stay zero-valued for now.
+// only; Profile, Similar and History are later context tiers.
 type Context struct {
-	Event  Event
-	Board  []Item // the relevant slice, not the whole board
-	Tenant string // scopes retrieval once the later tiers exist; empty in P0+1
+	Event Event
+	Board []Item // the relevant slice, not the whole board
 }
 
 // Source senses events and streams them until its context is cancelled.

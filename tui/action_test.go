@@ -16,15 +16,20 @@ func TestKinds(t *testing.T) {
 }
 
 func TestSubactionsGithub(t *testing.T) {
-	got := subactions("github")
-	want := []subaction{
-		{label: "pull request opened", on: "github.pull_request.opened"},
-		{label: "pull request closed", on: "github.pull_request.closed"},
-		{label: "pull request merged", on: "github.pull_request.merged"},
-		{label: "issues opened", on: "github.issues.opened"},
+	gotOns := subactionOns("github")
+	wantOns := []string{
+		"github.pull_request.opened",
+		"github.pull_request.closed",
+		"github.pull_request.merged",
+		"github.issues.opened",
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("subactions(github) = %#v, want %#v", got, want)
+	if !reflect.DeepEqual(gotOns, wantOns) {
+		t.Fatalf("subactionOns(github) = %#v, want %#v", gotOns, wantOns)
+	}
+	gotLabels := subactionLabels("github")
+	wantLabels := []string{"pull request opened", "pull request closed", "pull request merged", "issues opened"}
+	if !reflect.DeepEqual(gotLabels, wantLabels) {
+		t.Fatalf("subactionLabels(github) = %#v, want %#v", gotLabels, wantLabels)
 	}
 }
 

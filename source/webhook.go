@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/jwarykowski/drover/loop"
@@ -109,13 +110,7 @@ func (s WebhookSource) Events(ctx context.Context) <-chan loop.Event {
 // live.
 func (s WebhookSource) runForward(ctx context.Context) {
 	url := "http://" + s.addr() + "/hook"
-	events := ""
-	for i, e := range s.events() {
-		if i > 0 {
-			events += ","
-		}
-		events += e
-	}
+	events := strings.Join(s.events(), ",")
 	for ctx.Err() == nil {
 		cmd := exec.CommandContext(ctx, s.bin(), "webhook", "forward",
 			"--repo="+s.Repo, "--events="+events, "--url="+url)
@@ -139,11 +134,10 @@ func decodeGitHubWebhook(event string, raw []byte) ([]loop.Event, error) {
 		var p struct {
 			Action string `json:"action"`
 			PR     struct {
-				Number   int    `json:"number"`
-				Title    string `json:"title"`
-				HTMLURL  string `json:"html_url"`
-				Merged   bool   `json:"merged"`
-				MergeSHA string `json:"merge_commit_sha"`
+				Number  int    `json:"number"`
+				Title   string `json:"title"`
+				HTMLURL string `json:"html_url"`
+				Merged  bool   `json:"merged"`
 			} `json:"pull_request"`
 			Repo struct {
 				FullName string `json:"full_name"`
@@ -164,12 +158,8 @@ func decodeGitHubWebhook(event string, raw []byte) ([]loop.Event, error) {
 			ID:     fmt.Sprintf("github/%s:pr:%d:%s", repo, p.PR.Number, verb),
 			Type:   "github.pull_request." + verb,
 			Source: "github/" + repo,
-			Data: loop.Signal{
-				Repo: repo, Title: p.PR.Title, URL: p.PR.HTMLURL,
-				Key:   fmt.Sprintf("pr:%d:%s", p.PR.Number, verb),
-				Extra: map[string]any{"pr": p.PR.Number, "sha": p.PR.MergeSHA},
-			},
-			At: time.Now(),
+			Data:   loop.Signal{Repo: repo, Title: p.PR.Title, URL: p.PR.HTMLURL},
+			At:     time.Now(),
 		}}, nil
 
 	case "issues":
@@ -195,12 +185,8 @@ func decodeGitHubWebhook(event string, raw []byte) ([]loop.Event, error) {
 			ID:     fmt.Sprintf("github/%s:issue:%d:opened", repo, p.Issue.Number),
 			Type:   "github.issues.opened",
 			Source: "github/" + repo,
-			Data: loop.Signal{
-				Repo: repo, Title: p.Issue.Title, URL: p.Issue.HTMLURL,
-				Key:   fmt.Sprintf("issue:%d:opened", p.Issue.Number),
-				Extra: map[string]any{"issue": p.Issue.Number},
-			},
-			At: time.Now(),
+			Data:   loop.Signal{Repo: repo, Title: p.Issue.Title, URL: p.Issue.HTMLURL},
+			At:     time.Now(),
 		}}, nil
 	}
 	return nil, nil

@@ -28,13 +28,10 @@ type GitHubSource struct {
 
 // ghPR is the slice of `gh pr list --json` drover reads.
 type ghPR struct {
-	Number      int    `json:"number"`
-	Title       string `json:"title"`
-	URL         string `json:"url"`
-	MergedAt    string `json:"mergedAt"`
-	MergeCommit struct {
-		OID string `json:"oid"`
-	} `json:"mergeCommit"`
+	Number   int    `json:"number"`
+	Title    string `json:"title"`
+	URL      string `json:"url"`
+	MergedAt string `json:"mergedAt"`
 }
 
 func (s GitHubSource) base() string {
@@ -136,8 +133,6 @@ func decodeGitHubPRs(repo string, raw []byte) ([]loop.Event, error) {
 				Repo:  repo,
 				Title: pr.Title,
 				URL:   pr.URL,
-				Key:   fmt.Sprintf("pr:%d:merged", pr.Number),
-				Extra: map[string]any{"pr": pr.Number, "sha": pr.MergeCommit.OID},
 			},
 			At: time.Now(),
 		})
@@ -149,7 +144,7 @@ func decodeGitHubPRs(repo string, raw []byte) ([]loop.Event, error) {
 func ghMergedPRs(ctx context.Context, repo, base string) ([]byte, error) {
 	args := []string{
 		"pr", "list", "--repo", repo, "--base", base, "--state", "merged",
-		"--json", "number,title,url,mergedAt,mergeCommit", "--limit", "30",
+		"--json", "number,title,url,mergedAt", "--limit", "30",
 	}
 	cmd := exec.CommandContext(ctx, "gh", args...)
 	out, err := cmd.Output()

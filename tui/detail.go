@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jwarykowski/drover/registry"
 )
@@ -18,69 +17,43 @@ var (
 	hintStyle  = lipgloss.NewStyle().Faint(true)
 )
 
-// showDetail renders an action in a read-only, shepherd-styled screen until the
-// user presses q/esc/enter.
-func showDetail(a registry.Action) error {
-	_, err := tea.NewProgram(detailModel{a: a}, tea.WithAltScreen()).Run()
-	return err
-}
-
-type detailModel struct {
-	a registry.Action
-	w int
-}
-
-func (m detailModel) Init() tea.Cmd { return nil }
-
-func (m detailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.w = msg.Width
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "esc", "enter", "ctrl+c":
-			return m, tea.Quit
-		}
-	}
-	return m, nil
-}
-
-func (m detailModel) View() string {
-	w := m.w
-	if w <= 0 || w > 80 {
-		w = 80
-	}
+// renderDetail renders an action as a read-only, shepherd-styled screen. The
+// action model shows it in the sView state; any key returns to the list.
+func renderDetail(a registry.Action, w int) string {
 	rule := ruleStyle.Render(strings.Repeat("┈", w))
-
-	repo := m.a.Repo
+	repo := a.Repo
 	if repo == "" {
 		repo = "* (any)"
 	}
 
 	var b strings.Builder
-	fmt.Fprintln(&b, titleStyle.Render(m.a.Name))
+	fmt.Fprintln(&b, titleStyle.Render(a.Name))
 	fmt.Fprintln(&b, rule)
-	field(&b, "id", m.a.ID)
-	field(&b, "on", fmt.Sprintf("%s  (%s)", m.a.On, label(m.a.On)))
+	field(&b, "id", a.ID)
+	field(&b, "on", fmt.Sprintf("%s  (%s)", a.On, label(a.On)))
 	field(&b, "repo", repo)
-	field(&b, "target", m.a.Target)
-	field(&b, "mode", m.a.Mode)
-	if m.a.Source != "" {
-		field(&b, "source", m.a.Source)
+	if a.TargetBoard != "" {
+		field(&b, "target", a.TargetBoard+"  (board dir)")
+	} else {
+		field(&b, "target", a.Target)
 	}
-	if m.a.Base != "" {
-		field(&b, "base", m.a.Base)
+	field(&b, "mode", a.Mode)
+	if a.Source != "" {
+		field(&b, "source", a.Source)
 	}
-	if m.a.Interval != "" {
-		field(&b, "interval", m.a.Interval)
+	if a.Base != "" {
+		field(&b, "base", a.Base)
+	}
+	if a.Interval != "" {
+		field(&b, "interval", a.Interval)
 	}
 	fmt.Fprintln(&b, rule)
 	fmt.Fprintln(&b, keyStyle.Render("do"))
-	fmt.Fprintln(&b, m.a.Do)
+	fmt.Fprintln(&b, a.Do)
 	fmt.Fprintln(&b, rule)
-	fmt.Fprint(&b, hintStyle.Render("q/esc to go back"))
+	fmt.Fprint(&b, hintStyle.Render("press any key to go back"))
 
-	return lipgloss.NewStyle().Padding(1, 2).Render(b.String())
+	return b.String()
 }
 
 func field(b *strings.Builder, k, v string) {

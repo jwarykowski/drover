@@ -44,10 +44,11 @@ func (x StoreExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 	return nil
 }
 
-// taskExists reports whether an item already carries this link and action —
-// so a re-delivered event doesn't double-park, while a different action on the
-// same link still gets its own task. An empty link never dedups (nothing to key
-// on).
+// taskExists reports whether an ACTIVE (not-done) item already carries this link
+// and action — so a re-delivered event doesn't double-park while a run is in
+// flight, a different action on the same link still gets its own task, and a
+// completed run no longer blocks a fresh one (re-fire after done). An empty link
+// never dedups (nothing to key on).
 func (x StoreExecutor) taskExists(ctx context.Context, link, action string) (bool, error) {
 	if link == "" {
 		return false, nil
@@ -57,6 +58,9 @@ func (x StoreExecutor) taskExists(ctx context.Context, link, action string) (boo
 		return false, err
 	}
 	for _, it := range board {
+		if it.Done {
+			continue // a finished run no longer blocks a fresh trigger
+		}
 		if it.Link == link && it.Action == action {
 			return true, nil
 		}

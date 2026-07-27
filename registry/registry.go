@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -25,16 +26,17 @@ import (
 // flags — each github.* action carrying a repo also carries how to watch it
 // (empty fields fall back to the watch defaults).
 type Action struct {
-	ID       string `toml:"id"`                 // stable key the board references
-	Name     string `toml:"name"`               // friendly label, editable
-	On       string `toml:"on"`                 // event Type to match
-	Repo     string `toml:"repo,omitempty"`     // optional source filter (owner/name)
-	Base     string `toml:"base,omitempty"`     // github poll-mode branch; empty = master
-	Source   string `toml:"source,omitempty"`   // github sense: forward|poll; empty = forward
-	Interval string `toml:"interval,omitempty"` // github poll interval (e.g. "60s"); empty = 60s
-	Target   string `toml:"target"`             // cwd the agent runs in
-	Mode     string `toml:"mode"`               // claude permission mode
-	Do       string `toml:"do"`                 // the prompt body
+	ID          string `toml:"id"`                     // stable key the board references
+	Name        string `toml:"name"`                   // friendly label, editable
+	On          string `toml:"on"`                     // event Type to match
+	Repo        string `toml:"repo,omitempty"`         // optional source filter (owner/name)
+	Base        string `toml:"base,omitempty"`         // github poll-mode branch; empty = master
+	Source      string `toml:"source,omitempty"`       // github sense: forward|poll; empty = forward
+	Interval    string `toml:"interval,omitempty"`     // github poll interval (e.g. "60s"); empty = 60s
+	Target      string `toml:"target,omitempty"`       // literal cwd the agent runs in (custom dir)
+	TargetBoard string `toml:"target_board,omitempty"` // shepherd board whose dir is the cwd; resolved at run time
+	Mode        string `toml:"mode"`                   // claude permission mode
+	Do          string `toml:"do"`                     // the prompt body
 }
 
 // Registry is the loaded action set plus the path it came from. mu guards
@@ -182,19 +184,10 @@ func NewID() string {
 }
 
 // ValidType reports whether t is a known event type.
-func ValidType(t string) bool { return contains(KnownEventTypes, t) }
+func ValidType(t string) bool { return slices.Contains(KnownEventTypes, t) }
 
 // ValidMode reports whether m is a permitted claude permission mode.
-func ValidMode(m string) bool { return contains(ValidModes, m) }
-
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
-}
+func ValidMode(m string) bool { return slices.Contains(ValidModes, m) }
 
 // DefaultPath is where the registry lives unless --registry overrides it.
 func DefaultPath() string {

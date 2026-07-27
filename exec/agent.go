@@ -31,10 +31,15 @@ type AgentExecutor struct {
 	Bin         string        // agent binary; defaults to "claude"
 	Timeout     time.Duration // per-run deadline; 0 means none beyond ctx
 	Provenance  io.Writer
+	LogDir      string               // per-job claude stream logs (<LogDir>/<taskID>.jsonl); "" disables
 	Concurrency int                  // worker count once Start is called; <1 means 1
 	Logf        func(string, ...any) // worker error sink
-	// run executes the agent and returns its stdout; injectable for tests.
-	run func(ctx context.Context, cwd string, argv []string, timeout time.Duration) ([]byte, error)
+	// BoardDir resolves an action's TargetBoard to a working directory. Injected
+	// by the daemon (shepherd-backed); nil when no board references are expected.
+	BoardDir func(ctx context.Context, board string) (string, error)
+	// run executes the agent, teeing its output into logW (nil to skip) and
+	// returning its stdout; injectable for tests.
+	run func(ctx context.Context, cwd string, argv []string, timeout time.Duration, logW io.Writer) ([]byte, error)
 
 	jobs   chan agentJob // non-nil once Start ran: Apply enqueues instead of running inline
 	provMu sync.Mutex    // serialises provenance writes across workers
@@ -96,11 +101,82 @@ func (x *AgentExecutor) bin() string {
 	return x.Bin
 }
 
-func (x *AgentExecutor) runner() func(context.Context, string, []string, time.Duration) ([]byte, error) {
+func (x *AgentExecutor) runner() func(context.Context, string, []string, time.Duration, io.Writer) ([]byte, error) {
 	if x.run != nil {
 		return x.run
 	}
 	return agentRun
+}
+
+// openJobLog opens the per-job stream log, or returns nil (a no-op sink) when
+// logging is disabled or the run is detached (empty task id). Truncates so a
+// re-fired task starts a fresh log. A failure is non-fatal — the run proceeds
+// without a captured log.
+func (x *AgentExecutor) openJobLog(taskID string) io.Writer {
+	if x.LogDir == "" || taskID == "" {
+		return nil
+	}
+	if err := os.MkdirAll(x.LogDir, 0o755); err != nil {
+		if x.Logf != nil {
+			x.Logf("agent: job log dir %s: %v", x.LogDir, err)
+		}
+		return nil
+	}
+	f, err := os.OpenFile(filepath.Join(x.LogDir, taskID+".jsonl"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		if x.Logf != nil {
+			x.Logf("agent: job log %s: %v", taskID, err)
+		}
+		return nil
+	}
+	return &lineStampWriter{w: f}
+}
+
+// lineStampWriter prefixes each line it receives with a capture timestamp
+// ("15:04:05\t") before writing it on. claude's stream events don't all carry a
+// wall clock, so the detail view's timestamp column comes from here. It buffers
+// partial lines across writes and is mutex-guarded because os/exec pumps stdout
+// and stderr from separate goroutines into the same sink.
+type lineStampWriter struct {
+	w   io.Writer
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (l *lineStampWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf = append(l.buf, p...)
+	for {
+		i := bytes.IndexByte(l.buf, '\n')
+		if i < 0 {
+			break
+		}
+		if err := l.emit(l.buf[:i]); err != nil {
+			return 0, err
+		}
+		l.buf = l.buf[i+1:]
+	}
+	return len(p), nil
+}
+
+func (l *lineStampWriter) emit(line []byte) error {
+	_, err := fmt.Fprintf(l.w, "%s\t%s\n", time.Now().Format("15:04:05"), line)
+	return err
+}
+
+// Close flushes any trailing partial line, then closes the underlying file.
+func (l *lineStampWriter) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(bytes.TrimSpace(l.buf)) > 0 {
+		_ = l.emit(l.buf)
+	}
+	l.buf = nil
+	if c, ok := l.w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 // Apply enqueues each RunAgent to the worker pool (if Start ran) so sensing
@@ -148,10 +224,25 @@ func (x *AgentExecutor) handle(ctx context.Context, ra loop.RunAgent) error {
 	}
 
 	prompt := buildAgentPrompt(act, ra.Args)
-	argv := []string{x.bin(), "-p", prompt, "--permission-mode", mode(act.Mode)}
-	target := expandPath(act.Target)
+	// stream-json + --verbose makes claude emit the full turn (system, assistant
+	// messages, tool_use/tool_result, final result) as one JSON event per line,
+	// which is what the per-job log captures for the detail view.
+	argv := []string{x.bin(), "-p", prompt, "--permission-mode", mode(act.Mode), "--output-format", "stream-json", "--verbose"}
 
-	out, runErr := x.runner()(ctx, target, argv, x.Timeout)
+	// Tee the run into a per-job log file so the dashboard can show what the
+	// agent did. Keyed by task id; a re-fire truncates its own prior log.
+	logW := x.openJobLog(ra.TaskID)
+	if c, ok := logW.(io.Closer); ok {
+		defer func() { _ = c.Close() }()
+	}
+
+	// Resolve the cwd: a board reference resolves through shepherd at run time
+	// (so a moved board dir follows), else the literal target path.
+	target, runErr := x.resolveTarget(ctx, act)
+	var out []byte
+	if runErr == nil {
+		out, runErr = x.runner()(ctx, target, argv, x.Timeout, logW)
+	}
 	v := parseVerdict(out)
 	if runErr != nil {
 		v.Status = "failed"
@@ -275,8 +366,10 @@ func repoFromURL(u string) string {
 	return parts[0] + "/" + parts[1]
 }
 
-// parseVerdict reads the last JSON object in the agent's stdout. Absent or
-// malformed → treated as failed so the task is left running with a note.
+// parseVerdict extracts the agent's trailing JSON verdict. Under stream-json the
+// final text lives in the last {"type":"result",...} event's `result` field; in
+// plain text (or tests) it is the last {…} line of stdout. Absent or malformed →
+// treated as failed so the task is left running with a note.
 func parseVerdict(out []byte) verdict {
 	lines := strings.Split(string(out), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -284,12 +377,38 @@ func parseVerdict(out []byte) verdict {
 		if !strings.HasPrefix(s, "{") {
 			continue
 		}
-		var v verdict
-		if err := json.Unmarshal([]byte(s), &v); err == nil && v.Status != "" {
-			return v
+		var ev struct {
+			Type   string `json:"type"`
+			Result string `json:"result"`
+		}
+		if json.Unmarshal([]byte(s), &ev) == nil && ev.Type == "result" {
+			if v, ok := verdictFromText(ev.Result); ok {
+				return v
+			}
 		}
 	}
+	// Plain-text fallback: the verdict is a bare {…} line in the raw output.
+	if v, ok := verdictFromText(string(out)); ok {
+		return v
+	}
 	return verdict{Status: "failed", Summary: "no verdict in agent output"}
+}
+
+// verdictFromText finds the last line that parses as a verdict object (one with
+// a non-empty status).
+func verdictFromText(text string) (verdict, bool) {
+	lines := strings.Split(text, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		s := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(s, "{") {
+			continue
+		}
+		var v verdict
+		if err := json.Unmarshal([]byte(s), &v); err == nil && v.Status != "" {
+			return v, true
+		}
+	}
+	return verdict{}, false
 }
 
 func mode(m string) string {
@@ -297,6 +416,25 @@ func mode(m string) string {
 		return "default"
 	}
 	return m
+}
+
+// resolveTarget picks the agent's cwd: a board reference resolves through the
+// injected shepherd resolver at run time; otherwise the literal target path. An
+// empty result is intentional — the working dir is optional, so an action with
+// no target (or a board that has no dir set) runs in drover's own cwd. Such an
+// action may not touch a board at all (e.g. it updates an external service).
+func (x *AgentExecutor) resolveTarget(ctx context.Context, act registry.Action) (string, error) {
+	if act.TargetBoard == "" {
+		return expandPath(act.Target), nil
+	}
+	if x.BoardDir == nil {
+		return "", fmt.Errorf("action %q targets board %q but no board resolver is configured", act.ID, act.TargetBoard)
+	}
+	d, err := x.BoardDir(ctx, act.TargetBoard)
+	if err != nil {
+		return "", fmt.Errorf("resolve board %q: %w", act.TargetBoard, err)
+	}
+	return expandPath(strings.TrimSpace(d)), nil
 }
 
 func expandPath(p string) string {
@@ -309,8 +447,10 @@ func expandPath(p string) string {
 }
 
 // agentRun runs the agent with no shell, in cwd, capturing stdout for the
-// verdict; stderr streams to the operator.
-func agentRun(ctx context.Context, cwd string, argv []string, timeout time.Duration) ([]byte, error) {
+// verdict. When logW is non-nil the full stream (stdout + stderr) is mirrored
+// into it — the per-job log the detail view reads; otherwise stderr streams to
+// the operator as before.
+func agentRun(ctx context.Context, cwd string, argv []string, timeout time.Duration, logW io.Writer) ([]byte, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -319,8 +459,15 @@ func agentRun(ctx context.Context, cwd string, argv []string, timeout time.Durat
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = cwd
 	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = os.Stderr
+	if logW != nil {
+		// logW timestamps and serialises lines, so stdout and stderr can both feed
+		// it (os/exec pumps them from separate goroutines).
+		cmd.Stdout = io.MultiWriter(&stdout, logW)
+		cmd.Stderr = logW
+	} else {
+		cmd.Stdout = &stdout
+		cmd.Stderr = os.Stderr
+	}
 	err := cmd.Run()
 	return stdout.Bytes(), err
 }

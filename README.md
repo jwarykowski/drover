@@ -48,12 +48,19 @@ drover watch
    target dir, marking the task done from its verdict — each run logged as a
    JSON line on stdout. Nothing runs until you release it.
 
-That's the whole loop. `drover doctor` first if you want to prove the boundary
-before wiring anything up.
+That's the whole loop. Or skip the flags entirely: run **`drover`** for an
+interactive dashboard — pick the board and start/stop watching. Move across the
+held/running/done lanes with the arrow keys (or `j`/`k`), `g` to release a held
+run, `x` to delete one, `l` for the full-window daemon trace, and `d` (or
+`enter`) to open a job's **detail view** — its verdict and status, with `l`
+opening the agent's full conversation log (tailed live, persisted at
+`~/.config/drover/logs/<task-id>.jsonl`), `r` to restart the run and `x` to
+delete it. Keys mirror shepherd's (`d` detail, `x` delete). `drover doctor`
+first if you want to prove the boundary before wiring anything up.
 
 ## status
 
-Works end to end — sensing (GitHub PRs, Sentry issues, board changes), the
+Works end to end — sensing (GitHub PRs, board changes), the
 `hold → go` review gate, the allowlisted agent run, and reconcile-from-verdict.
 Each step sits behind a clean seam; see [how it works](#how-it-works).
 
@@ -97,13 +104,15 @@ applies:
 
 ## how it works
 
-Two flows share one loop, split by a `PolicyRouter` that matches on event-type
-prefix (first match wins).
+Two flows converge on one park → release → dispatch → reconcile path in the
+`FileStore`. They differ only in what parks the task: an upstream signal or a
+board change. Both park at `hold` and wait for a human to release them.
+shepherd is only ever read.
 
 **1. upstream signal → held task → human gate → agent run**
 
 ```
-PR merged / issue opened / sentry issue
+PR merged / issue opened
   → Ingress matches the event (type [+ repo]) against the registry
   → parks ONE held agentic task per match, carrying the action's id
   → a human flips hold → go in shepherd            # the review gate
@@ -115,17 +124,23 @@ PR merged / issue opened / sentry issue
 The hold→go gate is the whole safety story: an agent never runs on untrusted
 event text until a human releases it.
 
-**2. board change → trusted action**
+**2. board change → held task → human gate → agent run (shepherd is trigger-only)**
 
 ```
 board.{added,updated,removed,archived}   # from `shepherd watch`
-  → BoardTrigger matches human-authored items by type against the registry
-  → added/updated fire on the live item and reconcile a verdict
-  → removed/archived are terminal — fire-and-forget off the event payload
+  → BoardTrigger matches the change by type against the registry
+  → parks an agentic task at `hold` in the FileStore, carrying the board item id
+  → a human flips hold → go in the dashboard        # release to run manually
+  → Dispatcher claims `running` + emits RunAgent (same path as flow 1)
+  → reconciles the run in tasks.json — the shepherd item is NEVER written
 ```
 
-The `board.` route is a `Chain`: `Dispatcher` (agentic tasks, gated) then
-`BoardTrigger` (human-authored items). The catch-all route is `Ingress`.
+The board item is a pure trigger: drover reads it, queues a run off to the side,
+and leaves the person's todo exactly as they set it. Runs park in the held lane
+for the operator to release manually. Run state lives in `tasks.json`, so the
+dashboard shows board-triggered runs alongside sensed ones. Dedup keys on the
+board item id, so one item runs one action at a time and re-fires only after the
+previous run is done.
 
 Sensing is fanned in by `source.Merge`: the GitHub sense (push via
 `gh webhook forward`, or poll) plus `WatchSource` (shepherd's NDJSON stream)
@@ -137,20 +152,19 @@ run never blocks sensing.
 
 ```
 drover/
-  cmd/drover/main.go     watch | action | run | doctor
+  cmd/drover/main.go     CLI: watch | action | run | doctor (bare `drover` = dashboard)
   loop/loop.go           the seams + Loop wiring (interfaces only)
   store/shepherd.go      CLI adapter — the only file that knows shepherd
   store/locking.go       serialises concurrent shepherd calls (file-locked)
   store/fake.go          in-memory Store for tests
   context/assembler.go   WorkingContext — the attention slice
   registry/registry.go   the trusted registry of agent actions (RunAgent)
-  policy/router.go       PolicyRouter (prefix match) + Chain
+  policy/router.go       PolicyRouter (prefix match)
   policy/ingress.go      signal → held agentic task, via the registry
   policy/dispatch.go     released agentic task → RunAgent (gated hold→go)
-  policy/boardtrigger.go human-authored board change → RunAgent, by type
+  policy/boardtrigger.go board change → parks a drover run (shepherd untouched)
   source/github.go       poll merged PRs
   source/webhook.go      gh webhook forward receiver (push)
-  source/sentry.go       poll new Sentry issues
   source/watch.go        WatchSource — NDJSON over `shepherd watch`
   source/merge.go        fan several sources into one stream
   source/dedup.go        drop already-handled event ids (mem / file)
@@ -158,6 +172,10 @@ drover/
   exec/store.go          StoreExecutor — board mutations, idempotent by link
   exec/agent.go          AgentExecutor — worker pool, runs `claude`, reconciles
   exec/runner.go         RunnerExecutor — allowlisted commands, never board-shell
+  tui/daemon.go          RunDaemon — the watch wiring, shared by the CLI + dashboard
+  tui/dashboard.go       dashboard: board picker + in-process watch control + trace
+  tui/action.go          interactive action authoring (huh forms)
+  tui/detail.go          hand-rolled action detail view
   config/config.toml     the RunAction allowlist (for `drover run`)
 ```
 
@@ -208,6 +226,9 @@ needs `shepherd`; watching GitHub needs `gh`; agent runs shell `claude`).
 ## usage
 
 ```sh
+# the dashboard: pick a board, start/stop watch, work the lanes; l = full-window trace
+drover
+
 # prove the boundary: read the board, add a throwaway
 drover doctor --project <board>
 
@@ -233,9 +254,17 @@ drover watch --repo acme/api --project <board> --agents 2 \
 drover run fix-ci --arg repo=acme/api --arg task="fix the failing run" --yes
 ```
 
-Bare `drover action` opens an interactive TUI — pick a type (github/sentry/board)
-and subaction, and the prompt field is seeded with a sensible default you edit.
-It also lists, views, edits and deletes existing actions. `drover action
+Bare `drover` (on a terminal) opens the **dashboard**: the held/running/done
+lanes, a board picker (`b`) that defaults to **all boards** — one `shepherd
+watch` per board, fanned into one stream, the lanes grouped by a board
+sub-header — or narrowed to a single board, `s` to start/stop the watch daemon
+**in-process** with a ● running / ○ stopped indicator, `l` for the full-window
+daemon trace, and `a` to jump into the action manager and back — the daemon
+keeps running across that hop. Piped/CI, `drover` prints usage instead.
+
+`drover action` opens the action manager — pick a type (github/sentry/board) and
+subaction, and the prompt field is seeded with a sensible default you edit; it
+also lists, views, edits and deletes existing actions. `drover action
 list|edit|rm` are the scriptable equivalents; edits take effect on the next event
 without restarting `watch` (the registry reloads per event).
 

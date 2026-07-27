@@ -52,3 +52,28 @@ func TestApplyDedupByLink(t *testing.T) {
 		t.Errorf("new link twice: want 1 add, got %d", st.adds)
 	}
 }
+
+// A completed run no longer blocks a fresh trigger for the same link+action —
+// this is what lets a board item re-fire once its previous run is done.
+func TestApplyRefiresAfterDone(t *testing.T) {
+	st := &stubStore{items: []loop.Item{{ID: "1", Link: "board:h1", Action: "b1", Done: true}}}
+	x := StoreExecutor{Store: st}
+	act := []loop.Action{loop.AddTask{Spec: loop.Spec{Text: "again", Link: "board:h1", Action: "b1"}}}
+	if err := x.Apply(context.Background(), act); err != nil {
+		t.Fatal(err)
+	}
+	if st.adds != 1 {
+		t.Errorf("done item must not block re-fire: want 1 add, got %d", st.adds)
+	}
+
+	// An ACTIVE run with the same link+action still blocks.
+	st2 := &stubStore{items: []loop.Item{{ID: "2", Link: "board:h2", Action: "b1"}}}
+	x2 := StoreExecutor{Store: st2}
+	act2 := []loop.Action{loop.AddTask{Spec: loop.Spec{Text: "dup", Link: "board:h2", Action: "b1"}}}
+	if err := x2.Apply(context.Background(), act2); err != nil {
+		t.Fatal(err)
+	}
+	if st2.adds != 0 {
+		t.Errorf("active run must block a duplicate: want 0 adds, got %d", st2.adds)
+	}
+}

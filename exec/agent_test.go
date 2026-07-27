@@ -2,6 +2,9 @@ package exec
 
 import (
 	"context"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +23,19 @@ func TestBuildAgentPromptNamesRepoFromURL(t *testing.T) {
 	}
 }
 
+func TestResolveTargetEmptyBoardDirRunsInDefaultCwd(t *testing.T) {
+	// A board with no working dir is legal: the action may not touch a board.
+	// It must resolve to an empty cwd (drover's own dir), not error.
+	x := &AgentExecutor{BoardDir: func(context.Context, string) (string, error) { return "", nil }}
+	got, err := x.resolveTarget(context.Background(), registry.Action{ID: "a1", TargetBoard: "b1"})
+	if err != nil {
+		t.Fatalf("empty board dir must not error: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("empty board dir must resolve to empty cwd, got %q", got)
+	}
+}
+
 func TestAgentExecutorDoneReconciles(t *testing.T) {
 	reg := &registry.Registry{Actions: []registry.Action{
 		{ID: "a1", On: "github.pull_request.merged", Target: "/tmp", Mode: "acceptEdits", Do: "do the thing"},
@@ -29,7 +45,7 @@ func TestAgentExecutorDoneReconciles(t *testing.T) {
 
 	var gotArgv []string
 	x := AgentExecutor{Registry: reg, Store: st,
-		run: func(_ context.Context, _ string, argv []string, _ time.Duration) ([]byte, error) {
+		run: func(_ context.Context, _ string, argv []string, _ time.Duration, _ io.Writer) ([]byte, error) {
 			gotArgv = argv
 			return []byte("working...\n{\"status\":\"done\",\"summary\":\"bumped\",\"followups\":[\"regen docs\"]}\n"), nil
 		},
@@ -40,9 +56,12 @@ func TestAgentExecutorDoneReconciles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// claude -p <prompt> --permission-mode acceptEdits
-	if len(gotArgv) != 5 || gotArgv[0] != "claude" || gotArgv[1] != "-p" || gotArgv[3] != "--permission-mode" || gotArgv[4] != "acceptEdits" {
+	// claude -p <prompt> --permission-mode acceptEdits --output-format stream-json --verbose
+	if len(gotArgv) != 8 || gotArgv[0] != "claude" || gotArgv[1] != "-p" || gotArgv[3] != "--permission-mode" || gotArgv[4] != "acceptEdits" {
 		t.Fatalf("argv wrong: %v", gotArgv)
+	}
+	if gotArgv[5] != "--output-format" || gotArgv[6] != "stream-json" || gotArgv[7] != "--verbose" {
+		t.Fatalf("stream-json flags missing: %v", gotArgv)
 	}
 
 	// A done verdict archives the task off the live board (leaving the followup).
@@ -71,13 +90,81 @@ func TestAgentExecutorDoneReconciles(t *testing.T) {
 	}
 }
 
+func TestParseVerdictStreamJSON(t *testing.T) {
+	// A realistic stream-json tail: system/assistant/tool events, then the final
+	// result event whose `result` text ends with the verdict line.
+	out := strings.Join([]string{
+		`{"type":"system","subtype":"init","tools":["Bash"]}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}`,
+		`{"type":"result","subtype":"success","result":"did the thing\n{\"status\":\"done\",\"summary\":\"shipped\",\"followups\":[\"docs\"]}"}`,
+	}, "\n")
+	v := parseVerdict([]byte(out))
+	if v.Status != "done" || v.Summary != "shipped" || len(v.Followups) != 1 {
+		t.Fatalf("stream-json verdict not parsed: %#v", v)
+	}
+}
+
+func TestParseVerdictPlainTextFallback(t *testing.T) {
+	v := parseVerdict([]byte("chatter\n{\"status\":\"blocked\",\"summary\":\"nope\"}\n"))
+	if v.Status != "blocked" || v.Summary != "nope" {
+		t.Fatalf("plain-text verdict not parsed: %#v", v)
+	}
+}
+
+func TestAgentExecutorWritesJobLog(t *testing.T) {
+	reg := &registry.Registry{Actions: []registry.Action{{ID: "a1", Target: "/tmp"}}}
+	st := &store.FakeStore{}
+	st.Seed(loop.Item{ID: "t1", Status: "running", Agentic: true, Action: "a1"})
+	dir := t.TempDir()
+
+	x := AgentExecutor{Registry: reg, Store: st, LogDir: dir,
+		run: func(_ context.Context, _ string, _ []string, _ time.Duration, logW io.Writer) ([]byte, error) {
+			if logW == nil {
+				t.Fatal("expected a per-job log writer")
+			}
+			_, _ = io.WriteString(logW, `{"type":"assistant"}`+"\n")
+			return []byte(`{"status":"done","summary":"ok"}`), nil
+		},
+	}
+	if err := x.Apply(context.Background(), []loop.Action{loop.RunAgent{ActionID: "a1", TaskID: "t1"}}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "t1.jsonl"))
+	if err != nil {
+		t.Fatalf("job log not written: %v", err)
+	}
+	if !strings.Contains(string(b), `"type":"assistant"`) {
+		t.Fatalf("job log missing stream content: %q", b)
+	}
+}
+
+func TestAgentExecutorDetachedRunSkipsJobLog(t *testing.T) {
+	reg := &registry.Registry{Actions: []registry.Action{{ID: "a1", Target: "/tmp"}}}
+	st := &store.FakeStore{}
+	dir := t.TempDir()
+	x := AgentExecutor{Registry: reg, Store: st, LogDir: dir,
+		run: func(_ context.Context, _ string, _ []string, _ time.Duration, logW io.Writer) ([]byte, error) {
+			if logW != nil {
+				t.Fatal("detached run (empty task id) must not get a job log")
+			}
+			return []byte(`{"status":"done","summary":"ok"}`), nil
+		},
+	}
+	if err := x.Apply(context.Background(), []loop.Action{loop.RunAgent{ActionID: "a1", TaskID: ""}}); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("detached run wrote a log file: %v", entries)
+	}
+}
+
 func TestAgentExecutorMalformedVerdictLeavesRunning(t *testing.T) {
 	reg := &registry.Registry{Actions: []registry.Action{{ID: "a1", Target: "/tmp"}}}
 	st := &store.FakeStore{}
 	st.Seed(loop.Item{ID: "t1", Status: "running", Agentic: true, Action: "a1"})
 
 	x := AgentExecutor{Registry: reg, Store: st,
-		run: func(_ context.Context, _ string, _ []string, _ time.Duration) ([]byte, error) {
+		run: func(_ context.Context, _ string, _ []string, _ time.Duration, _ io.Writer) ([]byte, error) {
 			return []byte("no json here"), nil
 		},
 	}
@@ -101,7 +188,7 @@ func TestAgentExecutorPoolDoesNotBlockSensing(t *testing.T) {
 
 	release := make(chan struct{})
 	x := &AgentExecutor{Registry: reg, Store: st, Concurrency: 2,
-		run: func(context.Context, string, []string, time.Duration) ([]byte, error) {
+		run: func(context.Context, string, []string, time.Duration, io.Writer) ([]byte, error) {
 			<-release // hold the run open so a synchronous Apply would block
 			return []byte(`{"status":"done","summary":"ok"}`), nil
 		},
@@ -145,7 +232,7 @@ func TestAgentExecutorDetachedRunSkipsReconcile(t *testing.T) {
 	st := &store.FakeStore{}
 	ran := false
 	x := AgentExecutor{Registry: reg, Store: st,
-		run: func(context.Context, string, []string, time.Duration) ([]byte, error) {
+		run: func(context.Context, string, []string, time.Duration, io.Writer) ([]byte, error) {
 			ran = true
 			return []byte(`{"status":"done","summary":"cleaned","followups":["x"]}`), nil
 		},
@@ -168,7 +255,7 @@ func TestAgentExecutorUnknownActionNotesLeavesRunning(t *testing.T) {
 	st.Seed(loop.Item{ID: "t1", Status: "running", Agentic: true, Action: "ghost"})
 	ran := false
 	x := AgentExecutor{Registry: &registry.Registry{}, Store: st,
-		run: func(context.Context, string, []string, time.Duration) ([]byte, error) {
+		run: func(context.Context, string, []string, time.Duration, io.Writer) ([]byte, error) {
 			ran = true
 			return nil, nil
 		},

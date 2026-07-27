@@ -17,21 +17,21 @@ func (r recordExec) Apply(_ context.Context, a []loop.Action) error {
 }
 
 func TestRouterDispatchesByTypeInOrder(t *testing.T) {
-	var storeGot, runGot []loop.Action
+	var storeGot, agentGot []loop.Action
 	r := RouterExecutor{
-		Store:  recordExec{got: &storeGot},
-		Runner: recordExec{got: &runGot},
+		Store: recordExec{got: &storeGot},
+		Agent: recordExec{got: &agentGot},
 	}
 	seq := []loop.Action{
 		loop.SetStatus{ID: "x", Status: "running"},
-		loop.RunAction{Name: "run-skill"},
+		loop.RunAgent{ActionID: "a1"},
 		loop.SetStatus{ID: "x", Status: "done"},
 	}
 	if err := r.Apply(context.Background(), seq); err != nil {
 		t.Fatal(err)
 	}
-	if len(runGot) != 1 {
-		t.Fatalf("runner should get 1 RunAction, got %d", len(runGot))
+	if len(agentGot) != 1 {
+		t.Fatalf("agent should get 1 RunAgent, got %d", len(agentGot))
 	}
 	if len(storeGot) != 2 {
 		t.Fatalf("store should get 2 SetStatus, got %d", len(storeGot))
