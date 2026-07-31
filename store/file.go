@@ -126,6 +126,7 @@ func (s *FileStore) Add(_ context.Context, spec loop.Spec) (loop.Task, error) {
 		Text:     spec.Text,
 		Priority: strings.ToUpper(spec.Priority),
 		Status:   spec.Status,
+		Type:     spec.Type,
 		Action:   spec.Action,
 		Subject:  spec.Subject,
 		Due:      spec.Due,

@@ -47,6 +47,7 @@ type Task struct {
 	Due       string            `json:"due,omitempty"`
 	Link      string            `json:"link,omitempty"`
 	Status    string            `json:"status,omitempty"`
+	Type      string            `json:"type,omitempty"`    // the raising event's type, e.g. "shepherd.added"
 	Action    string            `json:"action,omitempty"`  // config action id — a reference, never a command
 	Subject   string            `json:"subject,omitempty"` // stable id of the thing the run concerns; the one-at-a-time key
 	Note      string            `json:"note,omitempty"`
@@ -65,6 +66,7 @@ type Spec struct {
 	Text     string
 	Priority string // H, M or L
 	Status   string // named status, e.g. "hold"; empty means default/open
+	Type     string // the raising event's type, e.g. "shepherd.added"
 	Action   string // config action id the agent resolves on release
 	Subject  string // stable id of the thing this run concerns; dedup key
 	Due      string
