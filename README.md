@@ -10,8 +10,8 @@
 > drives the flock, whoever tends it.
 
 drover is the sense → match → act loop. A **source** ingests events over one
-small protocol, an **action** matches one, and whichever **agentic tool** that
-action names runs against it. Sources are separate processes, so adding one is a
+small protocol, an **action** matches one, and whichever **runner** that action
+names runs against it. Sources are separate processes, so adding one is a
 config row — drover never learns what GitHub, Sentry or a todo board *is*.
 
 </td>
@@ -23,7 +23,7 @@ config row — drover never learns what GitHub, Sentry or a todo board *is*.
 - [the shape](#the-shape)
 - [the event protocol](#the-event-protocol)
 - [writing a source](#writing-a-source)
-- [agentic tools](#agentic-tools)
+- [runners](#runners)
 - [config](#config)
 - [how it works](#how-it-works)
 - [layout](#layout)
@@ -49,7 +49,7 @@ drover watch
 ```
 
 An event lands → drover parks **one held run**. Open the dashboard, flip it
-`hold → go`, and the action's agentic tool runs in its target directory, marking
+`hold → go`, and the action's runner runs in its target directory, marking
 the run done from its verdict — each run logged as a JSON line on stdout.
 Nothing runs until you release it, unless the action opts into `auto`.
 
@@ -69,7 +69,7 @@ and reconcile-from-verdict. Every step sits behind a seam; see
 ## the shape
 
 ```
-source (exec | http) → event → match action → run named agent → verdict → reconcile
+source (exec | http) → event → match action → run named runner → verdict → reconcile
 ```
 
 Five interfaces, and everything else is an implementation behind one:
@@ -162,8 +162,8 @@ the contract is real.
 ## runners
 
 A runner is an argv template. `{{prompt}}` receives the built prompt and
-`{{mode}}` the action's permission mode; a tool with no permission concept just
-omits it. Adding a second tool is a config row, not a release:
+`{{mode}}` the action's permission mode; a runner with no permission concept just
+omits it. Adding another runner is a config row, not a release:
 
 ```toml
 [[runner]]
@@ -178,7 +178,7 @@ cmd  = ["codex", "exec", "--full-auto", "{{prompt}}"]
 ```
 
 Each action names the runner it wants (`runner = "codex"`; empty takes the first).
-`modes` is that tool's own vocabulary — the action editor offers exactly those,
+`modes` is that runner's own vocabulary — the action editor offers exactly those,
 and a runner declaring none accepts anything, since drover can't know a
 third-party tool's flags.
 
@@ -244,7 +244,7 @@ runners are yours to write.
 
 ### the `auto` flag
 
-`auto = true` runs an agentic tool with file system access on event text, with
+`auto = true` runs a runner with file system access on event text, with
 no human in the loop. On a source whose text an outsider can write — a GitHub
 issue title, a Sentry message — that is a prompt-injection path straight to code
 execution. It defaults to `false`, `drover action` warns when it is paired with
@@ -260,7 +260,7 @@ event lands (exec plugin stdout, or an HTTP POST)
   → parks ONE held run per matching action, carrying the action's id
   → a human flips hold → go in the dashboard            # the review gate
   → the task store re-drives itself; Policy claims `running` + emits RunAgent
-  → AgentExecutor resolves the action, resolves its agent, renders the argv,
+  → AgentExecutor resolves the action, resolves its runner, renders the argv,
     runs it in the templated target directory
   → reconciles the run (done → archived / left running) from the verdict
 ```
@@ -352,7 +352,7 @@ drover source shepherd --all
 Two output streams keep machine trace and human log apart:
 
 - **stdout** — the structured trace: one JSON record per agent run (`at`,
-  `action`, `agent`, `task`, `target`, `status`, `summary`, `outcome`).
+  `action`, `runner`, `task`, `target`, `status`, `summary`, `outcome`).
 - **stderr** — the operational log: ingestion, parking, errors.
 
 ## design principles

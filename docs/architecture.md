@@ -1,13 +1,13 @@
 # drover architecture
 
 drover is the **sense → match → act** loop. A source ingests events over one
-small protocol, an action matches one, and whichever agentic tool that action
-names runs against it.
+small protocol, an action matches one, and whichever runner that action names
+runs against it.
 
 The organising idea: **drover knows nothing about any particular source or any
-particular tool.** A source is a separate process speaking one line-oriented
-protocol; a tool is an argv template. Both live in config, so adding either is a
-row in a file rather than a release.
+particular runner.** A source is a separate process speaking one line-oriented
+protocol; a runner is an argv template. Both live in config, so adding either is
+a row in a file rather than a release.
 
 - [the boundary](#the-boundary)
 - [the seams](#the-seams)
@@ -28,8 +28,8 @@ bytes. drover's own GitHub and shepherd support are ordinary plugins
 path — they have no privileged route in, which is what keeps the contract
 honest.
 
-**Agents.** drover holds an argv template and substitutes two values into it. It
-has no idea whether that runs claude, codex, or a shell script.
+**Runners.** drover holds an argv template and substitutes two values into it.
+It has no idea whether that runs claude, codex, or a shell script.
 
 ```mermaid
 flowchart LR
@@ -45,7 +45,7 @@ flowchart LR
     EX --> M{{Merge + Dedup}}
     HT --> M
     M --> L[loop.Loop]
-    L -->|argv template| AG["any agentic tool"]
+    L -->|argv template| AG["any runner"]
 ```
 
 `cmd/drover/source_shepherd.go` is the only file in the repo that knows shepherd
@@ -181,7 +181,7 @@ sequenceDiagram
     H->>FS: release → status=go
     FS-->>Pol: task.updated (750ms re-drive)
     Pol->>Ag: SetStatus(running) + RunAgent
-    Ag->>Ag: resolve action → resolve agent → render argv → run in target
+    Ag->>Ag: resolve action → resolve runner → render argv → run in target
     Ag->>FS: reconcile: Note + done + Archive
 ```
 
@@ -216,7 +216,7 @@ prompt as **data, not instructions**.
   An event can at most *select* an action that already exists.
 - Parked runs carry untrusted upstream text, so they wait at `hold` and fire
   only after a human flips `hold → go`.
-- **`auto = true` waives that gate.** An agentic tool with file system access
+- **`auto = true` waives that gate.** A runner with file system access
   then acts on event text with no human in the loop; on a source whose text an
   outsider can write, that is prompt injection to code execution. It defaults to
   false, `drover action` warns when it is paired with a permission-waiving mode,
