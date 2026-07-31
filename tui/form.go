@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/jwarykowski/drover/config"
 )
 
 // This file is drover's hand-rolled form widgets — a single-select picker and a
@@ -103,14 +104,66 @@ const (
 const labelW = 9 // field label column width (e.g. "target  ")
 
 type editor struct {
-	title  string
-	fields []*editField
-	typeF  *editField // event-family cycle; drives subF's options
-	subF   *editField // subaction cycle, rebuilt when typeF changes
-	doF    *editField // the prompt textarea, whose placeholder tracks subF
-	repoF  *editField // source filter; relabelled repo/project per kind
-	cur    int        // index into visible()
-	notice string
+	title   string
+	fields  []*editField
+	types   []string       // event types the configured sources declare
+	cf      *config.Config // runners and their accepted modes
+	typeF   *editField     // event-family cycle; drives subF's options
+	subF    *editField     // subaction cycle, rebuilt when typeF changes
+	doF     *editField     // the prompt textarea, whose placeholder tracks subF
+	runnerF *editField     // runner cycle; drives modeF's options
+	modeF   *editField     // permission mode cycle, rebuilt when runnerF changes
+	cur     int            // index into visible()
+	notice  string
+}
+
+// kinds are the event families across the declared types, in sorted order.
+func (e *editor) kinds() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, t := range e.types {
+		k := kindOf(t)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// subactionOns are the declared event types within a family (stored values).
+func (e *editor) subactionOns(kind string) []string {
+	var out []string
+	for _, t := range e.types {
+		if strings.HasPrefix(t, kind+".") {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// subactionLabels are the friendly labels parallel to subactionOns.
+func (e *editor) subactionLabels(kind string) []string {
+	ons := e.subactionOns(kind)
+	out := make([]string, len(ons))
+	for i, t := range ons {
+		out[i] = label(t)
+	}
+	return out
+}
+
+// modes are the permission values the named runner accepts. A runner that
+// declares none gets a single empty option — drover cannot invent a vocabulary
+// for a tool it knows nothing about.
+func (e *editor) modes(runner string) []string {
+	if e.cf == nil {
+		return []string{""}
+	}
+	g, err := e.cf.RunnerByName(runner)
+	if err != nil || len(g.Modes) == 0 {
+		return []string{""}
+	}
+	return g.Modes
 }
 
 func inputField(key string, val *string, placeholder, help string, req bool, hide func() bool) *editField {
@@ -150,14 +203,14 @@ func (e *editor) visible() []*editField {
 	return v
 }
 
-// reconcile keeps derived state consistent: rebuild the subaction options and
-// the prompt placeholder when the type changed, clamp the cursor to the visible
-// set, and refocus.
+// reconcile keeps derived state consistent: rebuild the subaction options when
+// the type changed and the mode options when the runner changed, refresh the
+// prompt placeholder, clamp the cursor to the visible set, and refocus.
 func (e *editor) reconcile() {
 	if e.typeF != nil && e.subF != nil {
 		kind := *e.typeF.val
-		if ons := subactionOns(kind); !slices.Equal(e.subF.opts, ons) {
-			e.subF.opts, e.subF.optLabels, e.subF.oi = ons, subactionLabels(kind), 0
+		if ons := e.subactionOns(kind); !slices.Equal(e.subF.opts, ons) {
+			e.subF.opts, e.subF.optLabels, e.subF.oi = ons, e.subactionLabels(kind), 0
 			if len(ons) > 0 {
 				*e.subF.val = ons[0]
 			} else {
@@ -168,13 +221,12 @@ func (e *editor) reconcile() {
 	if e.doF != nil && e.subF != nil {
 		e.doF.ta.Placeholder = defaultPrompt(*e.subF.val)
 	}
-	// The source filter is a repo for github, a project for sentry — same stored
-	// field (Action.Repo, matched against the event's source), different label.
-	if e.repoF != nil && e.typeF != nil {
-		if *e.typeF.val == "sentry" {
-			e.repoF.key, e.repoF.ti.Placeholder = "project", "project-slug"
-		} else {
-			e.repoF.key, e.repoF.ti.Placeholder = "repo", "owner/name"
+	// The mode vocabulary belongs to the chosen tool, so it is rebuilt whenever
+	// the runner changes rather than being a fixed list.
+	if e.runnerF != nil && e.modeF != nil {
+		if ms := e.modes(*e.runnerF.val); !slices.Equal(e.modeF.opts, ms) {
+			e.modeF.opts, e.modeF.optLabels, e.modeF.oi = ms, ms, 0
+			*e.modeF.val = ms[0]
 		}
 	}
 	if n := len(e.visible()); n == 0 {

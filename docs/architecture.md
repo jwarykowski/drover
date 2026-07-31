@@ -1,14 +1,17 @@
 # drover architecture
 
-drover is the **sense → assemble-context → act** loop *around*
-[shepherd](https://github.com/jwarykowski/shepherd). shepherd owns the todo
-file and stays a dumb, safe blackboard; drover senses events, reads the relevant
-slice of a board, decides, and — when allowed — runs an agent. drover speaks
-shepherd's CLI, never its file.
+drover is the **sense → match → act** loop. A source ingests events over one
+small protocol, an action matches one, and whichever agentic tool that action
+names runs against it.
+
+The organising idea: **drover knows nothing about any particular source or any
+particular tool.** A source is a separate process speaking one line-oriented
+protocol; a tool is an argv template. Both live in config, so adding either is a
+row in a file rather than a release.
 
 - [the boundary](#the-boundary)
-- [the four seams](#the-four-seams)
-- [the two task worlds](#the-two-task-worlds)
+- [the seams](#the-seams)
+- [the event protocol](#the-event-protocol)
 - [runtime wiring](#runtime-wiring)
 - [data flow](#data-flow)
 - [the trust boundary](#the-trust-boundary)
@@ -16,192 +19,216 @@ shepherd's CLI, never its file.
 
 ## the boundary
 
-Everything crosses one line: `loop.Store`. drover holds a `Store` interface and
-cannot tell which implementation it is. shepherd is reached over `os/exec`
-(`store.ShepherdStore`); drover's own tasks live in a JSON file
-(`store.FileStore`). Swap either without touching a policy.
+Two lines matter, and neither has a vendor on the inside.
+
+**Sources.** drover holds a `loop.Source` and cannot tell what is behind it. A
+local plugin is a spawned process read over stdout; a remote one POSTs the same
+bytes. drover's own GitHub and shepherd support are ordinary plugins
+(`drover source github`, `drover source shepherd`) spawned through the very same
+path — they have no privileged route in, which is what keeps the contract
+honest.
+
+**Agents.** drover holds an argv template and substitutes two values into it. It
+has no idea whether that runs claude, codex, or a shell script.
 
 ```mermaid
 flowchart LR
-    subgraph drover
-        L[loop.Loop]
+    subgraph plugins["source processes (any language)"]
+        GH["drover source github"]
+        SH["drover source shepherd"]
+        TP["your-plugin"]
     end
-    L -->|loop.Store iface| SS[store.ShepherdStore]
-    L -->|loop.Store iface| FS[store.FileStore]
-    SS -->|os/exec CLI| SH[("shepherd todo file")]
-    FS -->|atomic JSON| TJ[(tasks.json)]
+    GH -->|NDJSON stdout| EX[source.ExecSource]
+    SH -->|NDJSON stdout| EX
+    TP -->|NDJSON stdout| EX
+    RM["remote service"] -->|POST /events| HT[source.HTTPSource]
+    EX --> M{{Merge + Dedup}}
+    HT --> M
+    M --> L[loop.Loop]
+    L -->|argv template| AG["any agentic tool"]
 ```
 
-## the four seams
+`cmd/drover/source_shepherd.go` is the only file in the repo that knows shepherd
+exists. Drop it and drover still works; nothing else references it.
 
-The loop wires four interfaces (`loop/loop.go`) and imports only these — every
-component is an implementation behind one of them.
+## the seams
+
+The loop wires five interfaces (`loop/loop.go`) and imports only these.
 
 | seam | question | implementations |
 |---|---|---|
-| `Source` | what happened? | `WebhookSource`, `GitHubSource`, `WatchSource`, `FileStore`, `Merge`, `Dedup` |
-| `Assembler` | what's the relevant board slice? | `context.WorkingContext` |
-| `Policy` | what should we do? | `Ingress`, `Dispatcher`, `BoardTrigger`, `PolicyRouter` |
-| `Executor` | apply it | `RouterExecutor` → `StoreExecutor` / `AgentExecutor` / `RunnerExecutor` |
+| `Source` | what happened? | `ExecSource`, `HTTPSource`, `FileStore`, `Merge`, `Dedup` |
+| `Assembler` | which tasks are relevant? | `context.WorkingContext` |
+| `Store` | track the run | `FileStore` (JSON), `FakeStore` (tests) |
+| `Policy` | what should we do? | `policy.Policy` |
+| `Executor` | apply it | `RouterExecutor` → `StoreExecutor` / `AgentExecutor` |
 
 ```mermaid
 flowchart LR
     E([Event]) --> A["Assembler (WorkingContext)"]
-    A -->|Context: event + board slice| P[Policy]
+    A -->|"Context: event + tasks"| P[Policy]
     P -->|Actions| X[Executor]
-    X --> S[(Store)]
+    X --> S[(tasks.json)]
     X --> AG[agent run]
 ```
 
 One event drives one pass: `Assemble → Decide → Apply` (`loop.Loop.Run`).
 
-## the two task worlds
+There is **one event shape**, with an open `Data map[string]string`. That is
+load-bearing rather than lazy typing: a source is a separate process and cannot
+add a Go type, so a sealed payload union would make every new source family a
+drover code change. The same reasoning retired the compiled-in list of event
+types — sources declare their own now, and the action editor reads that.
 
-An agentic run is born two ways, but **both live in one store — the `FileStore`
-(`tasks.json`)**. shepherd is never written: it is a todo board a person owns and
-a pure *trigger* for drover, nothing more. This is the core decision:
-**everything drover runs is tracked and reconciled in `tasks.json`, so the board
-stays the human's and the dashboard sees every run in one place.**
+## the event protocol
 
-| | drover-sensed runs | board-triggered runs |
-|---|---|---|
-| origin | github / sentry event | a person changes a todo on a board |
-| store (run state) | `FileStore` (`tasks.json`) | `FileStore` (`tasks.json`) |
-| the shepherd item | — | **never touched** (stays as the human set it) |
-| parked at | `hold`, human flips `go` | `hold`, human flips `go` |
-| parked by | `Ingress` | `BoardTrigger` |
-| fired by | `Dispatcher` | `Dispatcher` |
-| completion written to | `tasks.json` | `tasks.json` |
+```json
+{"id":"shepherd:updated:a1:1753…","type":"shepherd.updated","source":"shepherd/work",
+ "at":"2026-07-30T09:00:00Z","data":{"title":"fix ci","subject":"a1","dir":"/src/work"}}
+```
 
-Both worlds converge on the same park → release → `Dispatcher` → reconcile path
-once the task is in the `FileStore`; they differ only in what parks the task.
-Both park at `hold` and wait for a human to release them (`hold → go`) — board
-triggers are a queue of suggested runs, not auto-fired.
+Required: `id`, `type`. Defaulted: `at` (receipt time), `source` (the config
+row's name), `data` (empty).
+
+`id` is the dedup key and must be unique **per logical event**. Two edits to one
+item are two events; reusing an id would have `Dedup` swallow every edit after
+the first. Recurrence is expressed with `subject` instead — a stable id for the
+thing the event concerns, which keeps one run per subject in flight without
+hiding later changes. A missing `id` is rejected rather than synthesised: a
+synthetic one would silently defeat dedup and re-fire everything on each restart.
+
+Three conventional keys (`title`, `url`, `subject`) are the only ones drover
+reads. Everything else flows through to the prompt, the `where` filter and the
+`target` template untouched.
 
 ## runtime wiring
 
-`tui.RunDaemon` runs **two concurrent loops** until the context is cancelled,
-both writing to the one `FileStore`. The board loop only *parks* a task; the
-drover loop's `Dispatcher` (fed by the store's own re-drive) fires it and the
-single `AgentExecutor` reconciles it.
+`daemon.Run` is the composition root — deliberately outside `tui`, so a headless
+`drover watch` and the source shims link none of the terminal machinery. It
+builds every source from config, fans them into one stream, and drives a
+**single loop**.
 
 ```mermaid
 flowchart TB
-    subgraph drvLoop["drover loop  (store = FileStore)"]
-        direction TB
-        GH["GitHubSource / WebhookSource"] --> M{Merge}
-        FSsrc["FileStore.Events (750ms re-drive)"] --> M
-        M --> PR["PolicyRouter: board.* to Dispatcher, catch-all to Ingress"]
-        PR --> RX1[RouterExecutor]
-        RX1 --> SE1["StoreExecutor to FileStore"]
-        RX1 --> AE1[AgentExecutor]
-        AE1 -->|reconcile| FSstore[(tasks.json)]
+    subgraph cfg["drover.toml"]
+        SRC["[[source]] rows"]
+        AGT["[[runner]] rows"]
+        ACT["[[action]] rows"]
     end
 
-    subgraph shepLoop["board loop  (trigger only)"]
-        direction TB
-        WS["WatchSource (shepherd watch NDJSON)"] --> BT[BoardTrigger]
-        BT --> SE2["StoreExecutor to FileStore"]
-    end
-
-    SE2 -->|park agentic task at hold| FSstore
-    AE1 -. "BoardDir resolves agent cwd" .-> SHhandle[ShepherdStore]
+    SRC --> B{{"daemon.build: cmd → Exec, http → HTTP"}}
+    B --> D1[Dedup]
+    D1 --> M{Merge}
+    RD["FileStore.Events (750ms re-drive)"] --> M
+    M --> P["policy.Policy"]
+    ACT -.->|match| P
+    P --> RX[RouterExecutor]
+    RX --> SE[StoreExecutor]
+    RX --> AE[AgentExecutor]
+    AGT -.->|argv template| AE
+    SE --> TJ[(tasks.json)]
+    AE -->|reconcile| TJ
 ```
 
 Notes:
 
+- **One loop, one store, one policy.** The previous design ran two concurrent
+  loops (one for upstream events, one for the board) with three policies and a
+  prefix router. With a single event shape they collapse: `policy.Policy`
+  handles a re-drive as a dispatch and everything else as a match.
 - **`FileStore` is both a `Source` and a `Store`.** A 750 ms ticker re-drives
-  each open task as a `board.updated` event, so a `hold → go` release dispatches
-  within a tick. `Dispatcher` reads the task's
-  *live* status (not the event's), so replaying an already-claimed task is a
-  no-op — idempotent.
-- **shepherd's only roles** are as a trigger `Source` (`shepherd watch`) and
-  `BoardDir`: resolving an action's target board to the agent's working dir. It
-  is read, never written.
-- **Watch scope.** A selected board runs one `shepherd watch --board <name>`.
-  The default (no board) watches *all* boards: drover enumerates them
-  (`shepherd boards`) and fans out one watch each through `source.Merge`, every
-  event pre-tagged with its board. The dashboard tags each run with its origin
-  board so the lanes can filter to one board or group by board across all. A
-  board created mid-run is picked up on the next daemon (re)start.
-- **One `AgentExecutor`, one worker pool** (`--agents` goroutines): both worlds
-  reconcile to the same `FileStore`, so a single pool suffices.
-- **Dedup / re-fire:** a parked board task carries the board item id as `Link`,
-  and `StoreExecutor` skips a park whose `Link`+`Action` matches an *active*
-  task. So one board item runs one action at a time, and re-fires only once the
-  previous run is done.
-- **Per-job logs.** `AgentExecutor` runs the agent with `--output-format
-  stream-json --verbose` and tees the whole turn (stdout + stderr) to
-  `<LogDir>/<taskID>.jsonl` (default `~/.config/drover/logs`). The dashboard's
-  job detail view shows the run's verdict; `l` opens the agent's full
-  conversation log as its own window, tailed live for a running job. From the
-  detail view `r` restarts the run (re-queued at `hold`, its stale log cleared)
-  and `x` deletes it (task and log) — key bindings mirror shepherd (`d` detail,
-  `x` delete). Completed runs are archived off the live
-  list but still surface in the `done` lane (their log persists by id).
+  each open task as a `task.updated` event carrying only the task id, so a
+  `hold → go` release dispatches within a tick. The policy resolves the task's
+  *live* status from the store, so replaying an already-claimed task is a no-op.
+- **The re-drive is not deduped.** It replays the same id every tick by design;
+  `Seen` would swallow every replay after the first. Only configured sources are
+  wrapped in `Dedup`.
+- **Config reloads per event**, so `drover action add|edit|rm` take effect in a
+  running daemon. Source rows are not re-read — a source is a running process,
+  so adding one needs a restart.
+- **A bad source row is skipped, not fatal.** A row setting neither transport
+  (or both) is logged and dropped; every other source still runs.
+- **One `AgentExecutor`, one worker pool** (`--agents` goroutines), so a long
+  run never blocks ingestion.
+- **Dedup / re-fire:** a parked run carries the event's `subject`, and
+  `StoreExecutor` skips a park whose `Subject`+`Action` matches an *active* run.
+  One subject runs one action at a time, re-firing only once the previous run is
+  done. Two different actions on one subject are two runs.
+- **Per-job logs.** `AgentExecutor` tees the whole run (stdout + stderr) to
+  `<LogDir>/<taskID>.jsonl` (default `~/.config/drover/logs`), timestamping each
+  line — not every tool stamps its own stream events. The dashboard's detail
+  view shows the verdict; `l` opens the full conversation log, tailed live. From
+  there `r` restarts the run (re-queued at `hold`, stale log cleared) and `x`
+  deletes it. Completed runs are archived off the live list but still surface in
+  the `done` lane.
 
 ## data flow
 
-### drover-sensed task (github → agent → tasks.json)
+### the whole path
 
 ```mermaid
 sequenceDiagram
-    participant GH as GitHub
-    participant Src as Source (webhook/poll)
-    participant Ing as Ingress
+    participant Src as source process
+    participant D as Dedup
+    participant Pol as policy.Policy
     participant FS as FileStore
-    participant Dsp as Dispatcher
     participant Ag as AgentExecutor
     participant H as human (dashboard)
 
-    GH->>Src: PR merged
-    Src->>Ing: Event (deduped)
-    Ing->>FS: AddTask (parked, status=hold, Agentic)
+    Src->>D: {"id":…,"type":…,"data":{…}}
+    D->>Pol: Event (first sighting only)
+    Pol->>FS: AddTask (status=hold, action id, subject, event data)
     H->>FS: release → status=go
-    FS-->>Dsp: board.updated (750ms re-drive)
-    Dsp->>Ag: SetStatus(running) + RunAgent
-    Ag->>Ag: run claude in target dir
+    FS-->>Pol: task.updated (750ms re-drive)
+    Pol->>Ag: SetStatus(running) + RunAgent
+    Ag->>Ag: resolve action → resolve agent → render argv → run in target
     Ag->>FS: reconcile: Note + done + Archive
 ```
 
-### board-triggered run (board change → drover task → tasks.json)
+An action marked `auto` parks at `go` rather than `hold`, so the same re-drive
+dispatches it on the next tick. There is deliberately no separate auto-fire
+branch to keep correct.
 
-The shepherd item is only ever read; the run is parked, fired and reconciled
-entirely in `tasks.json`, so the person's todo is left exactly as they set it.
+### where the agent runs
 
-```mermaid
-sequenceDiagram
-    participant P as person
-    participant SH as shepherd
-    participant WS as WatchSource
-    participant BT as BoardTrigger
-    participant FS as FileStore
-    participant Dsp as Dispatcher
-    participant Ag as AgentExecutor
+`target` is a template over the event's own data, which is how an action follows
+its event without drover resolving anything source-specific:
 
-    P->>SH: change todo (matches a registry action's type)
-    SH-->>WS: watch NDJSON: board.added / board.updated
-    WS->>BT: Event (BoardChange + full item JSON)
-    BT->>FS: AddTask (Agentic, status=hold, Link=item.ID) — dedup by Link+Action
-    Note over FS: waits in the held lane for a human to release (hold → go)
-    FS-->>Dsp: board.updated (750ms re-drive, after release)
-    Dsp->>Ag: SetStatus(running) + RunAgent(TaskID=task.ID)
-    Ag->>Ag: run claude in board's dir
-    Ag->>FS: reconcile: Note + done + Archive
-    Note over SH: shepherd item untouched throughout
-```
+| target | resolves to |
+|---|---|
+| `~/src/acme-api` | that literal path |
+| `~/src/{{repo}}` | the repo the event named |
+| `{{dir}}` | whatever directory the source put in `dir` |
+
+The shepherd shim reads `shepherd boards --json` once per stream and puts the
+board's working directory in every event's `dir`, so `target = "{{dir}}"` runs
+the agent in the board's own directory — with drover itself knowing nothing
+about boards. A placeholder the event never carried is a hard error: running
+somewhere unintended is worse than failing.
 
 ## the trust boundary
 
-drover never runs a string sourced from a board. What an agent *does* comes only
-from the trusted registry (`~/.config/drover/actions.toml`), keyed by action id;
-event text is fenced into the prompt as **data, not instructions**.
+drover never runs a string sourced from an event. What an agent *does* comes
+only from `drover.toml`, keyed by action id; event text is fenced into the
+prompt as **data, not instructions**.
 
-- `Ingress`-parked tasks carry untrusted upstream text, so they park at `hold`
-  and fire **only** after a human flips `hold → go`.
-- `BoardTrigger` also parks at `hold`: a board change queues a run for the
-  operator to release manually, never auto-fired. The parked task is agentic and
-  drover-owned — the run never writes back to the person's board.
+- Every command body — a source's argv, an agent's argv — lives in config alone.
+  An event can at most *select* an action that already exists.
+- Parked runs carry untrusted upstream text, so they wait at `hold` and fire
+  only after a human flips `hold → go`.
+- **`auto = true` waives that gate.** An agentic tool with file system access
+  then acts on event text with no human in the loop; on a source whose text an
+  outsider can write, that is prompt injection to code execution. It defaults to
+  false, `drover action` warns when it is paired with a permission-waiving mode,
+  and `drover doctor` flags it.
+- Template rendering fails closed. Event data (the untrusted path) is rejected
+  if it carries a newline or NUL. The agent argv path allows newlines — a prompt
+  is multi-line by construction — which is safe for a different reason: each
+  element becomes one execve argument with no shell and no re-parsing, so a
+  newline cannot become a second argument. NUL is still rejected, since it would
+  truncate the argument.
+- Prompt values are flattened to one line each, so a multi-line value cannot
+  forge extra context rows or a second `TASK:` line.
 - The agent's verdict maps only onto a fixed vocabulary (`done` / note / add
   follow-up). drover never executes what the agent returns.
 
@@ -209,12 +236,13 @@ event text is fenced into the prompt as **data, not instructions**.
 
 | package | role |
 |---|---|
-| `loop` | the four seam interfaces + `Loop.Run`; imports nothing else |
-| `context` | `WorkingContext` assembler (event → board slice) |
-| `policy` | `Ingress`, `Dispatcher`, `BoardTrigger`, `PolicyRouter` |
-| `source` | `WebhookSource`, `GitHubSource`, `WatchSource`, `Merge`, `Dedup`, `Seen` |
-| `exec` | `AgentExecutor`, `StoreExecutor`, `RunnerExecutor`, `RouterExecutor` |
-| `store` | `ShepherdStore` (CLI adapter), `FileStore` (JSON), `FakeStore` (tests) |
-| `registry` | the trusted action allowlist |
-| `tui` | dashboard, action manager, and `RunDaemon` (the two-loop wiring) |
-| `cmd/drover` | CLI entrypoint: `watch` / `action` / `run` / `doctor` |
+| `loop` | the seam interfaces + `Loop.Run`; imports nothing internal |
+| `config` | `drover.toml`: sources, runners, actions; match, resolve, save |
+| `context` | `WorkingContext` assembler (event → task slice) |
+| `policy` | `policy.Policy`: match → park, re-drive → dispatch |
+| `source` | the wire envelope, `ExecSource`, `HTTPSource`, `Merge`, `Dedup`, `Seen` |
+| `exec` | `AgentExecutor`, `StoreExecutor`, `RouterExecutor`, `{{key}}` templating |
+| `store` | `FileStore` (JSON + re-drive), `FakeStore` (tests) |
+| `daemon` | composition root: config → sources → loop |
+| `tui` | dashboard, action manager, form widgets |
+| `cmd/drover` | CLI entrypoint plus the two shipped source plugins |

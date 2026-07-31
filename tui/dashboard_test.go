@@ -16,7 +16,7 @@ import (
 )
 
 func TestLaneGroups(t *testing.T) {
-	m := dashboardModel{items: []loop.Item{
+	m := dashboardModel{items: []loop.Task{
 		{ID: "1", Status: "hold"},
 		{ID: "2", Status: "go"},
 		{ID: "3", Status: "running"},
@@ -66,7 +66,7 @@ func TestFormatJobLog(t *testing.T) {
 }
 
 func TestJobDetailNavOpensSelectedLane(t *testing.T) {
-	m := dashboardModel{items: []loop.Item{
+	m := dashboardModel{items: []loop.Task{
 		{ID: "h1", Status: "hold", Text: "held one"},
 		{ID: "r1", Status: "running", Text: "running one"},
 	}}
@@ -88,7 +88,7 @@ func TestJobDetailNavOpensSelectedLane(t *testing.T) {
 
 func TestReleaseOnlyOnHeldLane(t *testing.T) {
 	// `g` on a non-held lane must not attempt a release (no panic, no nil-store call).
-	m := dashboardModel{laneIdx: 1, items: []loop.Item{{ID: "r1", Status: "running"}}}
+	m := dashboardModel{laneIdx: 1, items: []loop.Task{{ID: "r1", Status: "running"}}}
 	mod, _ := m.updateMain(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
 	if mod.(dashboardModel).mode != modeMain {
 		t.Fatal("release key should be a no-op on the running lane")
@@ -96,7 +96,7 @@ func TestReleaseOnlyOnHeldLane(t *testing.T) {
 }
 
 func TestJobDetailOpensLogWindow(t *testing.T) {
-	m := dashboardModel{mode: modeJobDetail, job: loop.Item{ID: "j1", Status: "hold"}}
+	m := dashboardModel{mode: modeJobDetail, job: loop.Task{ID: "j1", Status: "hold"}}
 	mod, _ := m.updateJobDetail(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
 	if mod.(dashboardModel).mode != modeJobLog {
 		t.Fatal("l should open the full-window log")
@@ -167,63 +167,74 @@ func TestJobDetailResyncsFromStore(t *testing.T) {
 }
 
 func TestAllBoardsGroupsLanesByBoard(t *testing.T) {
-	items := []loop.Item{
-		{ID: "1", Status: "hold", Board: "work", Text: "a"},
-		{ID: "2", Status: "hold", Board: "home", Text: "b"},
-		{ID: "3", Status: "hold", Board: "", Text: "c"}, // sensed
+	items := []loop.Task{
+		{ID: "1", Status: "hold", Source: "work", Text: "a"},
+		{ID: "2", Status: "hold", Source: "home", Text: "b"},
+		{ID: "3", Status: "hold", Source: "", Text: "c"}, // sensed
 	}
-	// all-boards view (board == "") groups with sub-headers.
-	all := ansi.Strip(strings.Join(dashboardModel{board: "", items: items}.laneCol("held", "held", -1, 20, 40, false), "\n"))
-	for _, want := range []string{"─ home", "─ work", "sensed"} {
+	// all-sources view (source == "") groups with sub-headers.
+	all := ansi.Strip(strings.Join(dashboardModel{source: "", items: items}.laneCol("held", "held", -1, 20, 40, false), "\n"))
+	for _, want := range []string{"─ home", "─ work", "unattributed"} {
 		if !strings.Contains(all, want) {
-			t.Fatalf("all-boards lane missing group %q:\n%s", want, all)
+			t.Fatalf("all-sources lane missing group %q:\n%s", want, all)
 		}
 	}
-	// a selected board shows no board sub-headers.
-	one := ansi.Strip(strings.Join(dashboardModel{board: "work", items: items[:1]}.laneCol("held", "held", -1, 20, 40, false), "\n"))
+	// a selected source shows no sub-headers.
+	one := ansi.Strip(strings.Join(dashboardModel{source: "work", items: items[:1]}.laneCol("held", "held", -1, 20, 40, false), "\n"))
 	if strings.Contains(one, "─ work") {
-		t.Fatalf("single-board lane should not group by board:\n%s", one)
+		t.Fatalf("single-source lane should not group by source:\n%s", one)
 	}
 }
 
 func TestPickerIndex(t *testing.T) {
-	ps := []store.Board{{Name: "default"}, {Name: "work"}}
-	if got := pickerIndex(ps, ""); got != 0 {
-		t.Fatalf("all-boards should be row 0, got %d", got)
+	names := []string{"shepherd/default", "acme-api"}
+	if got := pickerIndex(names, ""); got != 0 {
+		t.Fatalf("all-sources should be row 0, got %d", got)
 	}
-	if got := pickerIndex(ps, "work"); got != 2 {
-		t.Fatalf("work should be row 2 (after all-boards + default), got %d", got)
+	if got := pickerIndex(names, "acme-api"); got != 2 {
+		t.Fatalf("acme-api should be row 2 (after all-sources + the first), got %d", got)
 	}
-	if got := pickerIndex(ps, "ghost"); got != 0 {
-		t.Fatalf("unknown board should fall back to all-boards, got %d", got)
+	if got := pickerIndex(names, "ghost"); got != 0 {
+		t.Fatalf("unknown source should fall back to all-sources, got %d", got)
 	}
 }
 
-func TestForBoardFiltersBySelection(t *testing.T) {
-	items := []loop.Item{
-		{ID: "1", Board: "work"},
-		{ID: "2", Board: "home"},
-		{ID: "3", Board: "default"},
-		{ID: "4", Board: ""}, // github/sentry-sensed: shows on every board
+// The source filter is exact: a run belongs to the source that raised it and to
+// no other, so selecting one hides every other source's runs.
+func TestForSourceFiltersBySelection(t *testing.T) {
+	items := []loop.Task{
+		{ID: "1", Source: "work"},
+		{ID: "2", Source: "home"},
+		{ID: "3", Source: "acme-api"},
+		{ID: "4", Source: ""},
 	}
-	// selected "work": its own runs + the board-less one.
-	got := dashboardModel{board: "work"}.forBoard(append([]loop.Item{}, items...))
-	if ids := itemIDs(got); !reflect.DeepEqual(ids, []string{"1", "4"}) {
-		t.Fatalf("work board = %v, want [1 4]", ids)
+	got := dashboardModel{source: "work"}.forSource(append([]loop.Task{}, items...))
+	if ids := itemIDs(got); !reflect.DeepEqual(ids, []string{"1"}) {
+		t.Fatalf("work source = %v, want [1]", ids)
 	}
-	// selected default board: its runs + board-less.
-	got = dashboardModel{board: "default"}.forBoard(append([]loop.Item{}, items...))
-	if ids := itemIDs(got); !reflect.DeepEqual(ids, []string{"3", "4"}) {
-		t.Fatalf("default board = %v, want [3 4]", ids)
+	got = dashboardModel{source: "acme-api"}.forSource(append([]loop.Task{}, items...))
+	if ids := itemIDs(got); !reflect.DeepEqual(ids, []string{"3"}) {
+		t.Fatalf("acme-api source = %v, want [3]", ids)
 	}
-	// all-boards (empty selection): no filter.
-	got = dashboardModel{board: ""}.forBoard(append([]loop.Item{}, items...))
+	// all sources (empty selection): no filter.
+	got = dashboardModel{source: ""}.forSource(append([]loop.Task{}, items...))
 	if ids := itemIDs(got); !reflect.DeepEqual(ids, []string{"1", "2", "3", "4"}) {
-		t.Fatalf("all boards = %v, want [1 2 3 4]", ids)
+		t.Fatalf("all sources = %v, want [1 2 3 4]", ids)
 	}
 }
 
-func itemIDs(items []loop.Item) []string {
+// knownSources drives the picker, so it must list each source once, sorted, and
+// ignore runs with no source.
+func TestKnownSources(t *testing.T) {
+	m := dashboardModel{items: []loop.Task{
+		{Source: "work"}, {Source: "acme-api"}, {Source: "work"}, {Source: ""},
+	}}
+	if got := m.knownSources(); !reflect.DeepEqual(got, []string{"acme-api", "work"}) {
+		t.Fatalf("knownSources = %v, want [acme-api work]", got)
+	}
+}
+
+func itemIDs(items []loop.Task) []string {
 	out := make([]string, len(items))
 	for i, it := range items {
 		out[i] = it.ID

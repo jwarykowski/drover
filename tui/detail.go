@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/jwarykowski/drover/registry"
+	"github.com/jwarykowski/drover/config"
 )
 
 // Styles mirror shepherd's TUI: ANSI-16 colours, faint rules, no borders.
@@ -17,13 +17,17 @@ var (
 	hintStyle  = lipgloss.NewStyle().Faint(true)
 )
 
-// renderDetail renders an action as a read-only, shepherd-styled screen. The
-// action model shows it in the sView state; any key returns to the list.
-func renderDetail(a registry.Action, w int) string {
+// renderDetail renders an action as a read-only screen. The action model shows
+// it in the sView state; any key returns to the list.
+func renderDetail(a config.Action, w int) string {
 	rule := ruleStyle.Render(strings.Repeat("┈", w))
-	repo := a.Repo
-	if repo == "" {
-		repo = "* (any)"
+	where := formatWhere(a.Where)
+	if where == "" {
+		where = "* (any)"
+	}
+	runner := a.Runner
+	if runner == "" {
+		runner = "(first configured)"
 	}
 
 	var b strings.Builder
@@ -31,21 +35,16 @@ func renderDetail(a registry.Action, w int) string {
 	fmt.Fprintln(&b, rule)
 	field(&b, "id", a.ID)
 	field(&b, "on", fmt.Sprintf("%s  (%s)", a.On, label(a.On)))
-	field(&b, "repo", repo)
-	if a.TargetBoard != "" {
-		field(&b, "target", a.TargetBoard+"  (board dir)")
-	} else {
-		field(&b, "target", a.Target)
-	}
+	field(&b, "where", where)
+	field(&b, "runner", runner)
 	field(&b, "mode", a.Mode)
-	if a.Source != "" {
-		field(&b, "source", a.Source)
-	}
-	if a.Base != "" {
-		field(&b, "base", a.Base)
-	}
-	if a.Interval != "" {
-		field(&b, "interval", a.Interval)
+	field(&b, "target", a.Target)
+	if a.Auto {
+		gate := "yes — fires with no human gate"
+		if a.Risky() {
+			gate += "  ⚠ in a permission-waiving mode"
+		}
+		field(&b, "auto", gate)
 	}
 	fmt.Fprintln(&b, rule)
 	fmt.Fprintln(&b, keyStyle.Render("do"))
@@ -60,7 +59,7 @@ func field(b *strings.Builder, k, v string) {
 	if v == "" {
 		v = "—"
 	}
-	const w = 7
+	const w = 7 // widest label: "target"/"where"
 	if len(k) < w {
 		k += strings.Repeat(" ", w-len(k))
 	}

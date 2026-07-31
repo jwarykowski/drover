@@ -1,0 +1,77 @@
+# Starter drover.toml for a GitHub repo.
+#
+# Copy the rows you want into ~/.config/drover/drover.toml (or author them with
+# `drover action`), and replace OWNER/REPO throughout. Every action parks a run
+# at hold — you release it from corral or `drover` — unless it sets auto = true.
+#
+# {{field}} in a `do` (or `target`) is filled from the event's data. Available
+# fields per event are listed above each action.
+
+# --- source -----------------------------------------------------------------
+# forward mode gets every event in real time (needs `gh` + a one-time
+# `gh extension install cli/gh-webhook`). For merges only, drop `--mode` and
+# `--addr` and it polls `gh pr list` instead — no inbound port, no webhook.
+[[source]]
+name  = "acme"
+cmd   = ["drover", "source", "github", "--repo", "OWNER/REPO", "--mode", "forward"]
+types = [
+  "github.pull_request.merged",
+  "github.pull_request.opened",
+  "github.issues.opened",
+  "github.issue_comment.created",
+  "github.check_suite.completed",
+]
+
+# --- runner ------------------------------------------------------------------
+[[runner]]
+name  = "claude"
+cmd   = ["claude", "-p", "{{prompt}}", "--permission-mode", "{{mode}}", "--output-format", "stream-json", "--verbose"]
+modes = ["bypassPermissions", "acceptEdits"]
+
+# --- actions ----------------------------------------------------------------
+
+# fields: repo, number, title, url, subject, author, base, head, labels, body
+[[action]]
+name   = "changelog-on-merge"
+on     = "github.pull_request.merged"
+runner = "claude"
+mode   = "acceptEdits"
+target = "~/src/{{repo}}"
+do     = "PR #{{number}} (\"{{title}}\") by {{author}} merged into {{base}} of {{repo}}. Update CHANGELOG.md and open a follow-up if public API or docs changed."
+
+# fields: repo, number, title, url, subject, author, base, head, labels, body
+[[action]]
+name  = "review-on-open"
+on    = "github.pull_request.opened"
+runner = "claude"
+mode  = "acceptEdits"
+do    = "Review PR #{{number}} \"{{title}}\" in {{repo}} ({{url}}). Summarise risk and leave concrete review comments."
+
+# fields: repo, number, title, url, subject, author, labels, body
+[[action]]
+name  = "triage-issue"
+on    = "github.issues.opened"
+runner = "claude"
+mode  = "acceptEdits"
+do    = "Triage issue #{{number}} \"{{title}}\" in {{repo}} ({{url}}). Reproduce if possible, label, and propose next steps."
+
+# fields: repo, number, url, subject, author, body, on_pr
+# gate on a command word so drover only acts on comments addressed to it
+[[action]]
+name  = "comment-command"
+on    = "github.issue_comment.created"
+where = { on_pr = "true" }
+runner = "claude"
+mode  = "acceptEdits"
+do    = "{{author}} commented on {{repo}} #{{number}} ({{url}}): \"{{body}}\". If it asks drover to do something, do it; otherwise reply that no action was taken."
+
+# fields: repo, conclusion, branch, sha, url, subject
+# check_suite fires on pass AND fail — `where` narrows it to failures
+[[action]]
+name   = "fix-failing-ci"
+on     = "github.check_suite.completed"
+where  = { conclusion = "failure" }
+runner = "claude"
+mode   = "acceptEdits"
+target = "~/src/{{repo}}"
+do     = "CI failed on {{branch}} ({{sha}}) of {{repo}}. Investigate {{url}}, find the cause, and propose a fix."

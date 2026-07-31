@@ -18,8 +18,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/jwarykowski/drover/config"
+	"github.com/jwarykowski/drover/daemon"
 	"github.com/jwarykowski/drover/loop"
-	"github.com/jwarykowski/drover/registry"
 	"github.com/jwarykowski/drover/store"
 )
 
@@ -53,16 +54,16 @@ func chromeFoot(w int) []string {
 	}
 }
 
-// Dashboard is the interactive control panel: pick a board, start/stop the watch
-// daemon in-process, watch a live trace, and manage actions — all in one
-// program. The Controller owns the daemon goroutine, so the watch keeps running
-// while the user is in the embedded action manager.
-func Dashboard(regPath string) error {
+// Dashboard is the interactive control panel: start/stop the watch daemon
+// in-process, filter the lanes by source, watch a live trace, and manage
+// actions — all in one program. The Controller owns the daemon goroutine, so
+// the watch keeps running while the user is in the embedded action manager.
+func Dashboard(cfgPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	ctrl := newController(ctx, regPath)
+	ctrl := newController(ctx, cfgPath)
 	ctrl.Start() // sense from the moment the dashboard opens; `s` toggles it off
-	m := dashboardModel{ctrl: ctrl, regPath: regPath, logDir: store.DefaultLogDir()}
+	m := dashboardModel{ctrl: ctrl, cfgPath: cfgPath, logDir: store.DefaultLogDir()}
 	m.refresh()
 	// ponytail: mouse capture disables native terminal text-selection; the wheel
 	// scroll is worth it for the log pane. Drop WithMouseCellMotion to get select back.
@@ -79,12 +80,12 @@ type Controller struct {
 	running bool
 	cancel  context.CancelFunc
 	done    chan struct{}
-	cfg     Config
+	cfg     daemon.Config
 	ring    *ring
 	tasks   *store.FileStore // shared task store: daemon + dashboard mutate the same instance
 }
 
-func newController(parent context.Context, regPath string) *Controller {
+func newController(parent context.Context, cfgPath string) *Controller {
 	// A load failure (corrupt tasks.json) shouldn't sink the dashboard — start
 	// empty and surface it in the trace; the file is rewritten on the next write.
 	tasks, err := store.OpenFileStore(store.DefaultTasksPath())
@@ -97,14 +98,11 @@ func newController(parent context.Context, regPath string) *Controller {
 		parent: parent,
 		ring:   ring,
 		tasks:  tasks,
-		cfg: Config{
-			Source:   "forward",
-			Addr:     "127.0.0.1:9099",
-			Interval: time.Minute,
-			RegPath:  regPath,
-			LogDir:   store.DefaultLogDir(),
-			Agents:   1,
-			Store:    tasks,
+		cfg: daemon.Config{
+			ConfigPath: cfgPath,
+			LogDir:     store.DefaultLogDir(),
+			Agents:     1,
+			Store:      tasks,
 		},
 	}
 }
@@ -123,7 +121,7 @@ func (c *Controller) Start() {
 	cfg := c.cfg
 	go func() {
 		defer close(done)
-		if err := RunDaemon(ctx, cfg, c.ring, c.ring.Logf); err != nil {
+		if err := daemon.Run(ctx, cfg, c.ring, c.ring.Logf); err != nil {
 			c.ring.Logf("daemon: %v", err)
 		}
 		// Natural exit (e.g. bind failure): reflect stopped, unless a newer run
@@ -151,24 +149,16 @@ func (c *Controller) Stop() {
 	<-done
 }
 
-// SetBoard points the daemon at a board; if running, it restarts to apply.
-func (c *Controller) SetBoard(name string) {
-	c.mu.Lock()
-	was := c.running
-	c.cfg.Board = name
-	c.mu.Unlock()
-	if was {
-		c.Stop()
-		c.Start()
-	}
-}
-
 // Status snapshots the daemon state for the view.
-func (c *Controller) Status() (running bool, board string, lines []logEntry) {
+//
+// There is no per-source daemon control any more: every configured source runs
+// whenever the watch runs, and the dashboard's source selection is purely a
+// view filter. Selecting one no longer restarts the daemon.
+func (c *Controller) Status() (running bool, lines []logEntry) {
 	c.mu.Lock()
-	running, board = c.running, c.cfg.Board
+	running = c.running
 	c.mu.Unlock()
-	return running, board, c.ring.Snapshot()
+	return running, c.ring.Snapshot()
 }
 
 // ---- ring: mutex-guarded capped line buffer bridging daemon → UI ----
@@ -224,8 +214,7 @@ func (r *ring) Snapshot() []logEntry {
 
 const (
 	modeMain = iota
-	modeBoardPick
-	modeBoardDetail
+	modeSourcePick
 	modeActions
 	modeJobDetail
 	modeJobLog
@@ -243,26 +232,24 @@ func tick() tea.Cmd {
 
 type dashboardModel struct {
 	ctrl    *Controller
-	regPath string
-	store   store.ShepherdStore
-	logDir  string // per-job claude stream logs, read for the job detail view
+	cfgPath string
+	logDir  string // per-job agent stream logs, read for the job detail view
 
 	mode      int
 	running   bool
-	board     string
+	source    string // lane filter; empty = every source, grouped
 	lines     []logEntry
-	acts      []registry.Action
-	items     []loop.Item // live board, for the kanban lanes
+	acts      []config.Action
+	items     []loop.Task // live runs, for the kanban lanes
 	laneIdx   int         // selected lane column: 0 held, 1 running, 2 done
 	hcursor   int         // cursor within the selected lane
 	logScroll int         // lines scrolled up from the tail; 0 = follow newest
 
-	boards  []store.Board
-	projErr string
+	sources []string // the sources that have actually raised runs
 	pcursor int
 
-	job       loop.Item // snapshot of the job open in modeJobDetail
-	jobLog    []jobRow  // its parsed claude stream log, refreshed live
+	job       loop.Task // snapshot of the job open in modeJobDetail
+	jobLog    []jobRow  // its parsed agent stream log, refreshed live
 	jobScroll int       // lines scrolled up from the tail of the job log
 
 	actionUI *actionsModel // embedded action manager when mode == modeActions
@@ -271,7 +258,7 @@ type dashboardModel struct {
 }
 
 // selectedLane is the item list for the currently selected lane column.
-func (m dashboardModel) selectedLane() []loop.Item { return m.lane(laneNames[m.laneIdx]) }
+func (m dashboardModel) selectedLane() []loop.Task { return m.lane(laneNames[m.laneIdx]) }
 
 // laneCursor returns the live cursor for lane i, or -1 when i is not selected
 // (so only the selected column shows a cursor).
@@ -283,14 +270,14 @@ func (m dashboardModel) laneCursor(i int) int {
 }
 
 func (m *dashboardModel) refresh() {
-	m.running, m.board, m.lines = m.ctrl.Status()
-	if reg, err := registry.Load(m.regPath); err == nil {
-		m.acts = reg.Actions
+	m.running, m.lines = m.ctrl.Status()
+	if cf, err := config.Load(m.cfgPath); err == nil {
+		m.acts = cf.Actions()
 	}
 	if items, err := m.ctrl.tasks.List(context.Background(), loop.Filter{IncludeDone: true}); err == nil {
 		// Include archived (completed) runs so the done lane stays reviewable — a
 		// done agentic task is archived off the live list but its log lives on.
-		m.items = m.forBoard(append(items, m.ctrl.tasks.Archived()...))
+		m.items = m.forSource(append(items, m.ctrl.tasks.Archived()...))
 	}
 	if sel := m.selectedLane(); m.hcursor >= len(sel) {
 		m.hcursor = max(0, len(sel)-1)
@@ -314,30 +301,44 @@ func (m *dashboardModel) refresh() {
 	}
 }
 
-// forBoard narrows the runs to the selected board. An empty selection is the
-// all-boards view (no filter — the lanes group by board instead). A specific
-// board shows its own runs plus board-less ones (github/sentry-sensed), which
-// aren't scoped to any board and so surface everywhere.
-func (m dashboardModel) forBoard(items []loop.Item) []loop.Item {
-	if m.board == "" {
+// forSource narrows the runs to the selected source. An empty selection is the
+// all-sources view (no filter — the lanes group by source instead).
+func (m dashboardModel) forSource(items []loop.Task) []loop.Task {
+	if m.source == "" {
 		return items
 	}
 	out := items[:0]
 	for _, it := range items {
-		if it.Board == "" || it.Board == m.board {
+		if it.Source == m.source {
 			out = append(out, it)
 		}
 	}
 	return out
 }
 
-// allBoards reports whether the dashboard is in the grouped all-boards view.
-func (m dashboardModel) allBoards() bool { return m.board == "" }
+// allSources reports whether the dashboard is in the grouped all-sources view.
+func (m dashboardModel) allSources() bool { return m.source == "" }
 
-// lane groups the board into a pipeline column. held = parked or released but
+// knownSources are the sources that have actually raised a run, sorted — the
+// picker lists these rather than the configured rows, so it always reflects
+// what is really on the lanes.
+func (m dashboardModel) knownSources() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, it := range m.items {
+		if it.Source != "" && !seen[it.Source] {
+			seen[it.Source] = true
+			out = append(out, it.Source)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// lane groups the runs into a pipeline column. held = parked or released but
 // not yet claimed (hold/go); running = claimed; done = finished.
-func (m dashboardModel) lane(which string) []loop.Item {
-	var out []loop.Item
+func (m dashboardModel) lane(which string) []loop.Task {
+	var out []loop.Task
 	for _, it := range m.items {
 		switch {
 		case which == "done" && it.Done:
@@ -350,14 +351,14 @@ func (m dashboardModel) lane(which string) []loop.Item {
 			out = append(out, it)
 		}
 	}
-	// Order by board so the all-boards view can group contiguously; board-less
-	// (sensed) runs sort last. Stable, so a single board keeps insertion order.
+	// Order by source so the all-sources view can group contiguously; runs with
+	// no source sort last. Stable, so a single source keeps insertion order.
 	sort.SliceStable(out, func(i, j int) bool {
-		bi, bj := out[i].Board, out[j].Board
-		if (bi == "") != (bj == "") {
-			return bj == "" // empty (sensed) after named boards
+		si, sj := out[i].Source, out[j].Source
+		if (si == "") != (sj == "") {
+			return sj == ""
 		}
-		return bi < bj
+		return si < sj
 	})
 	return out
 }
@@ -405,10 +406,8 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.mode {
 		case modeActions:
 			return m.delegateActions(msg)
-		case modeBoardPick:
-			return m.updateBoardPick(msg)
-		case modeBoardDetail:
-			return m.updateBoardDetail(msg)
+		case modeSourcePick:
+			return m.updateSourcePick(msg)
 		case modeJobDetail:
 			return m.updateJobDetail(msg)
 		case modeJobLog:
@@ -489,7 +488,7 @@ func (m dashboardModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.logScroll = 0
 		m.mode = modeLog
 	case "a":
-		m.actionUI = newActionsModel(m.regPath, false)
+		m.actionUI = newActionsModel(m.cfgPath, false)
 		// seed the embedded form's size; no WindowSizeMsg fires on a mode switch.
 		am, _ := m.actionUI.Update(tea.WindowSizeMsg{Width: m.w, Height: m.h})
 		m.actionUI = am.(*actionsModel)
@@ -503,12 +502,9 @@ func (m dashboardModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.refresh()
 	case "b":
-		if ps, err := m.store.Boards(context.Background()); err != nil {
-			m.projErr = err.Error()
-		} else {
-			m.projErr, m.boards, m.pcursor = "", ps, pickerIndex(ps, m.board)
-		}
-		m.mode = modeBoardPick
+		m.sources = m.knownSources()
+		m.pcursor = pickerIndex(m.sources, m.source)
+		m.mode = modeSourcePick
 	}
 	return m.clampLog(), nil
 }
@@ -545,7 +541,7 @@ func (m dashboardModel) clampLog() dashboardModel {
 	return m
 }
 
-func (m dashboardModel) updateBoardPick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m dashboardModel) updateSourcePick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		m.mode = modeMain
@@ -554,31 +550,18 @@ func (m dashboardModel) updateBoardPick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pcursor--
 		}
 	case "down", "j":
-		if m.pcursor < len(m.boards) { // row 0 = "all boards", then one per board
+		if m.pcursor < len(m.sources) { // row 0 = "all sources", then one each
 			m.pcursor++
-		}
-	case "d":
-		if m.pcursor > 0 { // no detail for the "all boards" row
-			m.mode = modeBoardDetail
 		}
 	case "enter":
 		if m.pcursor == 0 {
-			m.ctrl.SetBoard("") // all boards
+			m.source = ""
 		} else {
-			m.ctrl.SetBoard(m.boards[m.pcursor-1].Name)
+			m.source = m.sources[m.pcursor-1]
 		}
+		m.hcursor = 0
 		m.refresh()
 		m.mode = modeMain
-	}
-	return m, nil
-}
-
-// updateBoardDetail handles the read-only board detail; any exit key returns to
-// the picker.
-func (m dashboardModel) updateBoardDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc", "q", "d":
-		m.mode = modeBoardPick
 	}
 	return m, nil
 }
@@ -591,7 +574,7 @@ func (m dashboardModel) updateJobDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeMain
 		return m, nil
 	case "l":
-		// open the claude conversation log as its own full window.
+		// open the agent conversation log as its own full window.
 		m.jobLog = m.readJobLog(m.job.ID)
 		m.jobScroll = 0
 		m.mode = modeJobLog
@@ -609,7 +592,7 @@ func (m dashboardModel) updateJobDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.jobLog, m.jobScroll = nil, 0
 		m.refresh()
 	case "x":
-		// delete: drop this run and its log, back to the board (shepherd's del key).
+		// delete: drop this run and its log, back to the lanes.
 		_ = m.ctrl.tasks.Delete(context.Background(), m.job.ID)
 		m.removeJobLog(m.job.ID)
 		m.mode, m.jobScroll = modeMain, 0
@@ -641,7 +624,7 @@ func (m dashboardModel) updateJobLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // releasable reports whether a job is a parked (held) run awaiting release.
-func releasable(j loop.Item) bool { return !j.Done && j.Status == "hold" }
+func releasable(j loop.Task) bool { return !j.Done && j.Status == "hold" }
 
 // clampJob keeps the job-log scroll offset inside the pane.
 func (m dashboardModel) clampJob() dashboardModel {
@@ -658,11 +641,8 @@ func (m dashboardModel) View() string {
 	if m.mode == modeActions && m.actionUI != nil {
 		return m.actionsView()
 	}
-	if m.mode == modeBoardPick {
-		return m.boardPickView()
-	}
-	if m.mode == modeBoardDetail {
-		return m.boardDetailView()
+	if m.mode == modeSourcePick {
+		return m.sourcePickView()
 	}
 	if m.mode == modeJobDetail {
 		return m.jobDetailView()
@@ -685,7 +665,7 @@ func (m dashboardModel) actionsView() string {
 
 func (m dashboardModel) mainView() string {
 	w := innerWidth(m.w)
-	hints := hintStyle.Render("↑/↓/←/→ move · d detail · g release · x del · l log · s start/stop · b board · a actions · q quit")
+	hints := hintStyle.Render("↑/↓/←/→ move · d detail · g release · x del · l log · s start/stop · b source · a actions · q quit")
 
 	laneH := max(3, fillCount(m.h, 4)-1) // body rows (head+foot=4), -1 for the hints line
 	body := m.laneRows(w, laneH)
@@ -711,9 +691,9 @@ func (m dashboardModel) laneRows(w, laneH int) []string {
 }
 
 // eventSource is the trigger an item's run came from — the `on:` type of its
-// registry action (e.g. "board.added", "github.pull_request.merged"). Empty if
+// registry action (e.g. "shepherd.added", "github.pull_request.merged"). Empty if
 // the action is unknown. Shown as a card subline.
-func (m dashboardModel) eventSource(it loop.Item) string {
+func (m dashboardModel) eventSource(it loop.Task) string {
 	for _, a := range m.acts {
 		if a.ID == it.Action {
 			return a.On
@@ -732,16 +712,16 @@ func (m dashboardModel) laneCol(which, title string, cursor, laneH, w int, focus
 	if len(items) == 0 {
 		return []string{head, hintStyle.Render("(none)")}
 	}
-	vis := max(1, laneH-1)   // rows below the header for item blocks
-	grouped := m.allBoards() // group by board sub-header across all boards
+	vis := max(1, laneH-1)    // rows below the header for item blocks
+	grouped := m.allSources() // group by source sub-header across all sources
 
 	// each item renders as a block: an optional board sub-header (first item of a
 	// group in the all-boards view), the card — label flush-left, id flush-right —
 	// then its event source subline.
 	block := func(i int) []string {
 		var lines []string
-		if grouped && (i == 0 || items[i].Board != items[i-1].Board) {
-			lines = append(lines, hintStyle.Render(boardGroupLabel(items[i].Board)))
+		if grouped && (i == 0 || items[i].Source != items[i-1].Source) {
+			lines = append(lines, hintStyle.Render(sourceGroupLabel(items[i].Source)))
 		}
 		id := keyStyle.Render("#" + shortID(items[i].ID))
 		label := truncate(itemLabel(items[i]), max(1, w-lipgloss.Width(id)-1))
@@ -861,12 +841,12 @@ func sectionTitle(s string, focused bool) string {
 	return keyStyle.Render(s)
 }
 
-// boardGroupLabel is the dim sub-header dividing one board's runs from the next
-// in the all-boards view; board-less (sensed) runs group under "sensed".
-func boardGroupLabel(board string) string {
-	name := board
+// sourceGroupLabel is the dim sub-header dividing one source's runs from the
+// next in the all-sources view.
+func sourceGroupLabel(source string) string {
+	name := source
 	if name == "" {
-		name = "sensed"
+		name = "unattributed"
 	}
 	label := "─ " + name + " "
 	if n := 18 - lipgloss.Width(label); n > 0 {
@@ -875,7 +855,7 @@ func boardGroupLabel(board string) string {
 	return label
 }
 
-func itemLabel(it loop.Item) string {
+func itemLabel(it loop.Task) string {
 	if s := strings.TrimSpace(it.Text); s != "" {
 		return s
 	}
@@ -920,17 +900,14 @@ func cell(s string, w int) string {
 	return s
 }
 
-func (m dashboardModel) boardPickView() string {
+func (m dashboardModel) sourcePickView() string {
 	w := innerWidth(m.w)
 	rule := ruleStyle.Render(strings.Repeat("┈", w))
-	head := []string{titleStyle.Render("select board"), rule}
-	if m.projErr != "" {
-		head = append(head, warnStyle.Render(truncate(m.projErr, w)))
-	}
-	foot := []string{rule, hintStyle.Render("↑/↓ move · enter select · d detail · esc back")}
+	head := []string{titleStyle.Render("filter by source"), rule}
+	foot := []string{rule, hintStyle.Render("↑/↓ move · enter select · esc back")}
 
-	// mark the row drover is pointed at: ● on the selected board, or on "all
-	// boards" when nothing is pinned (the watch-everything default).
+	// mark the row the lanes are filtered to: ● on the selected source, or on
+	// "all sources" when nothing is pinned (the default).
 	dot := func(on bool) string {
 		if on {
 			return runStyle.Render("● ")
@@ -944,42 +921,31 @@ func (m dashboardModel) boardPickView() string {
 		return "  "
 	}
 
-	// row 0: the all-boards option.
-	body := []string{truncate(fmt.Sprintf("%s%sall boards", arrow(m.pcursor == 0), dot(m.board == "")), w)}
-	for i, p := range m.boards {
-		counts := keyStyle.Render(fmt.Sprintf("%d/%d", p.Open, p.Total))
+	// row 0: the all-sources option.
+	body := []string{truncate(fmt.Sprintf("%s%sall sources", arrow(m.pcursor == 0), dot(m.source == "")), w)}
+	for i, name := range m.sources {
+		open, total := m.sourceCounts(name)
+		counts := keyStyle.Render(fmt.Sprintf("%d/%d", open, total))
 		body = append(body, truncate(fmt.Sprintf("%s%s%s  %s",
-			arrow(i+1 == m.pcursor), dot(m.board != "" && p.Name == m.board), p.Name, counts), w))
+			arrow(i+1 == m.pcursor), dot(m.source != "" && name == m.source), name, counts), w))
 	}
 	body = pad(body, m.fillRows(len(head)+len(foot)))
 	return frame(head, body, foot)
 }
 
-// boardDetailView is the read-only detail for the highlighted board: name,
-// working dir (with an on-disk existence marker, since the dir is a plain string
-// shepherd can't track across moves) and item counts.
-func (m dashboardModel) boardDetailView() string {
-	w := innerWidth(m.w)
-	rule := ruleStyle.Render(strings.Repeat("┈", w))
-	b := m.boards[m.pcursor-1] // row 0 is "all boards"; real boards start at 1
-
-	dirVal := hintStyle.Render("(not set)")
-	if b.Dir != "" {
-		mark := ""
-		if _, err := os.Stat(expandTilde(b.Dir)); err != nil {
-			mark = "  " + warnStyle.Render("(missing)")
+// sourceCounts is open/total runs raised by a source, for the picker rows.
+// Counted over the unfiltered set so the numbers don't change with the filter.
+func (m dashboardModel) sourceCounts(name string) (open, total int) {
+	for _, it := range m.items {
+		if it.Source != name {
+			continue
 		}
-		dirVal = valStyle.Render(b.Dir) + mark
+		total++
+		if !it.Done {
+			open++
+		}
 	}
-	head := []string{titleStyle.Render("board · " + b.Name), rule}
-	foot := []string{rule, hintStyle.Render("d/esc back")}
-	body := []string{
-		metaField("name", valStyle.Render(b.Name)),
-		metaField("dir", dirVal),
-		metaField("items", keyStyle.Render(fmt.Sprintf("%d/%d", b.Total-b.Open, b.Total))),
-	}
-	body = pad(body, m.fillRows(len(head)+len(foot)))
-	return frame(head, body, foot)
+	return open, total
 }
 
 // jobDetailView is the read-only detail for a selected job: its verdict/status
@@ -1228,13 +1194,13 @@ func (m dashboardModel) statusLine() string {
 	if m.running {
 		status = runStyle.Render("● running")
 	}
-	board := "all boards"
-	if m.board != "" {
-		board = boardName(m.board)
+	source := "all sources"
+	if m.source != "" {
+		source = m.source
 	}
-	return fmt.Sprintf("%s   board %s   %s",
+	return fmt.Sprintf("%s   %s   %s",
 		status,
-		valStyle.Render(board),
+		valStyle.Render(source),
 		keyStyle.Render(fmt.Sprintf("%d action(s)", len(m.acts))),
 	)
 }
@@ -1262,14 +1228,14 @@ func pad(lines []string, n int) []string {
 	return lines
 }
 
-// pickerIndex maps the selected board to a picker row: 0 = "all boards",
-// otherwise the matching board's row (its index + 1). Unknown/empty → all.
-func pickerIndex(ps []store.Board, board string) int {
-	if board == "" {
+// pickerIndex maps the selected source to a picker row: 0 = "all sources",
+// otherwise the matching source's row (its index + 1). Unknown/empty → all.
+func pickerIndex(names []string, source string) int {
+	if source == "" {
 		return 0
 	}
-	for i, p := range ps {
-		if p.Name == board {
+	for i, n := range names {
+		if n == source {
 			return i + 1
 		}
 	}

@@ -1,29 +1,25 @@
-// Package tui is drover's interactive UI: the dashboard (board + watch control)
-// and the action manager for the trusted registry. The action manager is a
-// bubbletea model so it runs standalone (`drover action`) or embedded in the
-// dashboard — pressing `a` there never leaves the dashboard program.
+// Package tui is drover's interactive UI: the dashboard (lanes + watch control)
+// and the action manager for drover.toml. The action manager is a bubbletea
+// model so it runs standalone (`drover action`) or embedded in the dashboard —
+// pressing `a` there never leaves the dashboard program.
 package tui
 
 import (
-	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/jwarykowski/drover/registry"
-	"github.com/jwarykowski/drover/store"
+	"github.com/jwarykowski/drover/config"
 )
 
 // newSentinel is the list value that means "create a new action".
 const newSentinel = "\x00new"
 
-// targetCustom is the target cycle value meaning "a custom path, not a board".
-const targetCustom = "\x00custom"
-
 // Run opens the action manager standalone (`drover action`).
-func Run(regPath string) error {
-	_, err := tea.NewProgram(newActionsModel(regPath, true), tea.WithAltScreen()).Run()
+func Run(cfgPath string) error {
+	_, err := tea.NewProgram(newActionsModel(cfgPath, true), tea.WithAltScreen()).Run()
 	return err
 }
 
@@ -38,34 +34,33 @@ const (
 	sView                 // read-only detail
 )
 
-// actionsModel is the registry manager as a tea.Model. Standalone it quits when
+// actionsModel is the action manager as a tea.Model. Standalone it quits when
 // the user leaves the list; embedded (standalone=false) it sets done so the
 // dashboard pops back without tearing down the watch daemon.
 type actionsModel struct {
-	regPath    string
-	reg        *registry.Registry
+	cfgPath    string
+	cf         *config.Config
 	standalone bool
-	store      store.ShepherdStore // board listing for the target picker
 
 	state   astate
-	pick    *picker         // sList, sVerb, sDelete
-	ed      *editor         // sDetail
-	buf     form            // create/edit field buffer
-	curID   string          // selected action id
-	editing bool            // sDetail applies to an existing action
-	choice  string          // last picker selection
-	view    registry.Action // sView subject
+	pick    *picker       // sList, sVerb, sDelete
+	ed      *editor       // sDetail
+	buf     form          // create/edit field buffer
+	curID   string        // selected action id
+	editing bool          // sDetail applies to an existing action
+	choice  string        // last picker selection
+	view    config.Action // sView subject
 
 	w, h int
 	done bool
 }
 
-func newActionsModel(regPath string, standalone bool) *actionsModel {
-	reg, _ := registry.Load(regPath)
-	if reg == nil {
-		reg = &registry.Registry{Path: regPath}
+func newActionsModel(cfgPath string, standalone bool) *actionsModel {
+	cf, _ := config.Load(cfgPath)
+	if cf == nil {
+		cf = &config.Config{Path: cfgPath}
 	}
-	m := &actionsModel{regPath: regPath, reg: reg, standalone: standalone}
+	m := &actionsModel{cfgPath: cfgPath, cf: cf, standalone: standalone}
 	m.enter(sList)
 	return m
 }
@@ -166,8 +161,7 @@ func (m *actionsModel) enter(s astate) tea.Cmd {
 	case sVerb:
 		m.pick = m.verbPicker()
 	case sDetail:
-		boards, _ := m.store.Boards(context.Background()) // best-effort; empty → custom-only
-		m.ed = newEditor(m.editorTitle(), &m.buf, boards)
+		m.ed = newEditor(m.editorTitle(), &m.buf, m.cf)
 		return textinput.Blink
 	case sDelete:
 		m.pick = m.deletePicker()
@@ -187,7 +181,7 @@ func (m *actionsModel) advance() tea.Cmd {
 	switch m.state {
 	case sList:
 		if m.choice == newSentinel {
-			m.buf = form{kind: "github", mode: registry.AutoModes[0]}
+			m.buf = form{kind: firstKind(m.cf), runner: firstRunner(m.cf)}
 			m.editing = false
 			return m.enter(sDetail)
 		}
@@ -196,12 +190,12 @@ func (m *actionsModel) advance() tea.Cmd {
 	case sVerb:
 		switch m.choice {
 		case "view":
-			if a, ok := m.reg.ByID(m.curID); ok {
+			if a, ok := m.cf.ByID(m.curID); ok {
 				m.view = a
 			}
 			return m.enter(sView)
 		case "edit":
-			if a, ok := m.reg.ByID(m.curID); ok {
+			if a, ok := m.cf.ByID(m.curID); ok {
 				m.buf = fromAction(a)
 			}
 			m.editing = true
@@ -214,18 +208,17 @@ func (m *actionsModel) advance() tea.Cmd {
 	case sDetail:
 		a := toAction(m.buf)
 		if m.editing {
-			_ = m.reg.Remove(m.curID)
 			a.ID = m.curID
-			m.reg.Actions = append(m.reg.Actions, a)
+			_ = m.cf.Replace(a)
 		} else {
-			_, _ = m.reg.Add(a)
+			_, _ = m.cf.Add(a)
 		}
-		_ = m.reg.Save()
+		_ = m.cf.Save()
 		return m.enter(sList)
 	case sDelete:
 		if m.choice == "delete" {
-			_ = m.reg.Remove(m.curID)
-			_ = m.reg.Save()
+			_ = m.cf.Remove(m.curID)
+			_ = m.cf.Save()
 		}
 		return m.enter(sList)
 	}
@@ -246,7 +239,7 @@ func (m *actionsModel) back() tea.Cmd {
 
 func (m *actionsModel) listPicker() *picker {
 	p := &picker{title: "drover actions", desc: "enter to open · esc to go back"}
-	for _, a := range m.reg.Actions {
+	for _, a := range m.cf.Actions() {
 		p.opts = append(p.opts, pickOption{a.Summary(), a.ID})
 	}
 	p.opts = append(p.opts, pickOption{"＋ new action", newSentinel})
@@ -254,7 +247,7 @@ func (m *actionsModel) listPicker() *picker {
 }
 
 func (m *actionsModel) verbPicker() *picker {
-	a, _ := m.reg.ByID(m.curID)
+	a, _ := m.cf.ByID(m.curID)
 	return &picker{
 		title: a.Name,
 		desc:  a.On,
@@ -268,7 +261,7 @@ func (m *actionsModel) verbPicker() *picker {
 }
 
 func (m *actionsModel) deletePicker() *picker {
-	a, _ := m.reg.ByID(m.curID)
+	a, _ := m.cf.ByID(m.curID)
 	return &picker{
 		title: fmt.Sprintf("delete %q?", a.Name),
 		opts:  []pickOption{{"cancel", "cancel"}, {"delete", "delete"}},
@@ -277,136 +270,147 @@ func (m *actionsModel) deletePicker() *picker {
 
 // form is the editable state bound to the editor fields.
 type form struct {
-	kind      string // event family: github | sentry | board
-	on        string // full event type, e.g. github.pull_request.merged
-	name      string
-	repo      string
-	base      string // github poll-mode branch
-	source    string // github sense: forward | poll
-	interval  string // github poll interval, e.g. 60s
-	targetSel string // board name, or targetCustom for a literal path
-	target    string // custom path (when targetSel == targetCustom)
-	mode      string
-	do        string
+	kind   string // event family, e.g. "github" — derived from the declared types
+	on     string // full event type, e.g. github.pull_request.merged
+	onFree string // hand-typed event type, when no source declares any
+	name   string
+	where  string // event data filter as "key=value, key=value"
+	runner string // which runner runs
+	target string // runner cwd; may template {{key}} from event data
+	mode   string
+	auto   string // "false" | "true"
+	do     string
 }
 
-// newEditor builds the action editor over a buffer. Fields hide by relevance:
-// board has no repo filter, the sensing knobs are github-only, base/interval
-// only apply in poll mode, and the custom-dir input only shows when target isn't
-// a board. boards populates the target picker.
-func newEditor(title string, f *form, boards []store.Board) *editor {
-	e := &editor{title: title}
-	typeF := cycleField("type", kinds(), kinds(), &f.kind,
-		"Which product emits the event. Sets the subactions and sensing options below.", nil)
-	subF := cycleField("subaction", subactionOns(f.kind), subactionLabels(f.kind), &f.on,
-		"The exact event that triggers this action.", nil)
-	doF := areaField("do",
-		&f.do, "The task prompt handed to the agent. drover frames it with event context at run time. Leave empty to use the shown default.")
+// newEditor builds the action editor over a buffer.
+//
+// Everything offered here comes from config rather than from a compiled-in list:
+// the event types are the ones the installed sources declare, the runners are the
+// ones configured, and the modes are the ones that runner says it accepts. A new
+// source or a new tool shows up in this form without drover being rebuilt.
+func newEditor(title string, f *form, cf *config.Config) *editor {
+	e := &editor{title: title, types: cf.Types(), cf: cf}
+
+	declared := len(e.types) > 0
+	typeF := cycleField("type", e.kinds(), e.kinds(), &f.kind,
+		"Which source family emits the event. Sets the subactions below.",
+		func() bool { return !declared })
+	subF := cycleField("subaction", e.subactionOns(f.kind), e.subactionLabels(f.kind), &f.on,
+		"The exact event that triggers this action.",
+		func() bool { return !declared })
+	// No source declares its types (a plugin that doesn't advertise, or none
+	// installed yet) — take the event type as free text rather than offering an
+	// empty picker.
+	freeF := inputField("on", &f.onFree, "e.g. jira.issue.created",
+		"The event type to match, exactly as the source emits it.", true,
+		func() bool { return declared })
+	doF := areaField("do", &f.do,
+		"The task prompt handed to the runner. drover frames it with event context at run time. Leave empty to use the shown default.")
 	e.typeF, e.subF, e.doF = typeF, subF, doF
 
-	// target: a shepherd board (its dir, resolved at run time) or a custom path.
-	tOpts, tLabels := boardTargetOptions(boards)
-	if f.targetSel == "" {
-		f.targetSel = tOpts[0]
+	runners := cf.RunnerNames()
+	if len(runners) == 0 {
+		runners = []string{""}
 	}
-	targetF := cycleField("target", tOpts, tLabels, &f.targetSel,
-		"Where the agent runs. Pick a shepherd board (its dir, resolved live at run time) or a custom path.", nil)
-	customF := inputField("dir", &f.target, "e.g. ~/src/acme-api",
-		"Literal working directory for this action.", true, func() bool { return f.targetSel != targetCustom })
+	runnerF := cycleField("runner", runners, runners, &f.runner,
+		"Which runner runs this action. Configure more with [[runner]] in drover.toml.", nil)
+	e.runnerF = runnerF
 
-	// source filter: repo for github (owner/name), project for sentry. reconcile
-	// swaps the label/placeholder by kind; hidden for board (no source filter).
-	repoF := inputField("repo", &f.repo, "owner/name",
-		"Only react to events from this source. github: owner/name. sentry: the project slug. Empty = any.", false,
-		func() bool { return f.kind == "board" })
-	e.repoF = repoF
+	modeF := cycleField("mode", e.modes(f.runner), e.modes(f.runner), &f.mode,
+		"How much the runner may do unattended. The values come from the chosen runner.", nil)
+	e.modeF = modeF
 
-	notGithub := func() bool { return f.kind != "github" }
-	notPoll := func() bool { return f.kind != "github" || f.source != "poll" }
+	autoF := cycleField("auto", []string{"false", "true"}, []string{"no — wait for a human release", "yes — fire on match"}, &f.auto,
+		"auto=yes runs the runner with no human gate. Only for a source whose content you control: the runner acts on event text drover did not author.", nil)
 
 	e.fields = []*editField{
 		typeF,
 		subF,
+		freeF,
 		inputField("name", &f.name, "e.g. fix-ci",
 			"A short label for this action, shown in lists and logs.", true, nil),
-		targetF,
-		customF,
-		cycleField("mode", registry.AutoModes, registry.AutoModes, &f.mode,
-			"How much the agent may do unattended.", nil),
-		repoF,
-		cycleField("source", registry.ValidSources, registry.ValidSources, &f.source,
-			"How drover watches the repo. forward receives webhooks; poll checks on an interval.", notGithub),
-		inputField("base", &f.base, "master",
-			"Poll mode: the branch to watch. Empty = master.", false, notPoll),
-		inputField("interval", &f.interval, "60s",
-			"Poll mode: how often to check, e.g. 60s.", false, notPoll),
+		inputField("where", &f.where, "repo=acme/api",
+			"Only react to events whose data carries these values. Comma-separated key=value. Empty = any.", false, nil),
+		runnerF,
+		modeF,
+		inputField("target", &f.target, "~/src/acme-api",
+			"Where the runner runs. May template event data: {{dir}}, ~/src/{{repo}}. Empty runs in drover's own directory.", false, nil),
+		autoF,
 		doF, // the prompt textarea sits last: it's the tallest field and the focus of authoring
 	}
 	e.reconcile()
 	return e
 }
 
-// boardTargetOptions builds the target cycle: each board (label shows its dir),
-// then a "custom path" entry. Always non-empty (custom is the fallback).
-func boardTargetOptions(boards []store.Board) (opts, labels []string) {
-	for _, b := range boards {
-		dir := b.Dir
-		if dir == "" {
-			dir = "no dir set"
-		}
-		opts = append(opts, b.Name)
-		labels = append(labels, b.Name+" — "+dir)
+func toAction(f form) config.Action {
+	on := f.on
+	if strings.TrimSpace(f.onFree) != "" {
+		on = strings.TrimSpace(f.onFree)
 	}
-	return append(opts, targetCustom), append(labels, "custom path…")
-}
-
-func toAction(f form) registry.Action {
 	do := strings.TrimSpace(f.do)
 	if do == "" { // left empty → the shown default prompt for this event
-		do = defaultPrompt(f.on)
+		do = defaultPrompt(on)
 	}
-	a := registry.Action{
-		Name: strings.TrimSpace(f.name),
-		On:   f.on,
-		Repo: strings.TrimSpace(f.repo),
-		Mode: f.mode,
-		Do:   do,
+	return config.Action{
+		Name:   strings.TrimSpace(f.name),
+		On:     on,
+		Where:  parseWhere(f.where),
+		Runner: f.runner,
+		Mode:   f.mode,
+		Target: strings.TrimSpace(f.target),
+		Auto:   f.auto == "true",
+		Do:     do,
 	}
-	// target is either a board reference (resolved at run time) or a literal path.
-	if f.targetSel == "" || f.targetSel == targetCustom {
-		a.Target = strings.TrimSpace(f.target)
-	} else {
-		a.TargetBoard = f.targetSel
-	}
-	// github-only knobs; leave empty for other families so their rows stay clean.
-	if f.kind == "github" {
-		a.Base = strings.TrimSpace(f.base)
-		a.Source = f.source
-		a.Interval = strings.TrimSpace(f.interval)
-	} else {
-		a.Repo = "" // repo filter is a github/sentry notion; board has none
-	}
-	return a
 }
 
-func fromAction(a registry.Action) form {
-	targetSel := targetCustom
-	if a.TargetBoard != "" {
-		targetSel = a.TargetBoard
+func fromAction(a config.Action) form {
+	auto := "false"
+	if a.Auto {
+		auto = "true"
 	}
 	return form{
-		kind:      kindOf(a.On),
-		on:        a.On,
-		name:      a.Name,
-		repo:      a.Repo,
-		base:      a.Base,
-		source:    a.Source,
-		interval:  a.Interval,
-		targetSel: targetSel,
-		target:    a.Target,
-		mode:      a.Mode,
-		do:        a.Do,
+		kind:   kindOf(a.On),
+		on:     a.On,
+		onFree: a.On,
+		name:   a.Name,
+		where:  formatWhere(a.Where),
+		runner: a.Runner,
+		target: a.Target,
+		mode:   a.Mode,
+		auto:   auto,
+		do:     a.Do,
 	}
+}
+
+// parseWhere reads "repo=acme/api, label=p0" into a filter map. Malformed
+// segments are dropped rather than rejected — a half-typed filter shouldn't
+// block saving the rest of the action.
+func parseWhere(s string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if !ok || k == "" {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func formatWhere(m map[string]string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(m))
+	for k, v := range m {
+		parts = append(parts, k+"="+v)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
 }
 
 // kindOf is the event family: the segment before the first dot.
@@ -417,41 +421,19 @@ func kindOf(on string) string {
 	return on
 }
 
-// kinds are the event families in the order they first appear in the registry's
-// known types (github, sentry, board).
-func kinds() []string {
-	var out []string
-	seen := map[string]bool{}
-	for _, t := range registry.KnownEventTypes {
-		k := kindOf(t)
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
+func firstKind(cf *config.Config) string {
+	for _, t := range cf.Types() {
+		return kindOf(t)
 	}
-	return out
+	return ""
 }
 
-// subactionOns are the known event types within a family (the stored values).
-func subactionOns(kind string) []string {
-	var out []string
-	for _, t := range registry.KnownEventTypes {
-		if strings.HasPrefix(t, kind+".") {
-			out = append(out, t)
-		}
+func firstRunner(cf *config.Config) string {
+	names := cf.RunnerNames()
+	if len(names) == 0 {
+		return ""
 	}
-	return out
-}
-
-// subactionLabels are the friendly labels parallel to subactionOns.
-func subactionLabels(kind string) []string {
-	var out []string
-	for _, t := range registry.KnownEventTypes {
-		if strings.HasPrefix(t, kind+".") {
-			out = append(out, label(t))
-		}
-	}
-	return out
+	return names[0]
 }
 
 // label renders an event type without its family prefix, in words:
@@ -466,17 +448,28 @@ func label(on string) string {
 
 // defaultPrompts seed the `do` field per event type — the "generic prompt" the
 // user then edits. buildAgentPrompt frames this into the full agent prompt at
-// run time, so these are just the task intent.
+// run time, so these are just the task intent. An unlisted type (any plugin's)
+// falls back to the generic seed.
 var defaultPrompts = map[string]string{
 	"github.pull_request.merged": "A PR merged. If CI on the base branch is red, open a fix PR.",
 	"github.pull_request.opened": "A PR opened. Review the diff and leave your findings as a note.",
 	"github.pull_request.closed": "A PR closed without merging. Note anything that needs following up.",
 	"github.issues.opened":       "An issue was opened. Triage it and propose next steps.",
 	"sentry.issue.opened":        "A Sentry issue opened. Investigate the stack trace and propose a fix.",
-	"board.added":                "A board item was added. Handle it per its description.",
-	"board.updated":              "A board item changed. Reconcile the change per its description.",
-	"board.removed":              "A board item was removed. Clean up anything it left behind.",
-	"board.archived":             "A board item was archived. Wrap up any loose ends.",
+	"shepherd.added":             "A board item was added. Handle it per its description.",
+	"shepherd.updated":           "A board item changed. Reconcile the change per its description.",
+	"shepherd.removed":           "A board item was removed. Clean up anything it left behind.",
+	"shepherd.archived":          "A board item was archived. Wrap up any loose ends.",
 }
 
-func defaultPrompt(on string) string { return defaultPrompts[on] }
+const genericPrompt = "Handle this event using the context above, then report what you did."
+
+func defaultPrompt(on string) string {
+	if p, ok := defaultPrompts[on]; ok {
+		return p
+	}
+	if on == "" {
+		return ""
+	}
+	return genericPrompt
+}

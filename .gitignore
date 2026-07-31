@@ -1,2 +1,5 @@
 /drover
 *.exe
+
+# macOS
+.DS_Store

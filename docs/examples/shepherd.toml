@@ -1,0 +1,58 @@
+# Starter drover.toml for shepherd (the todo-board source).
+#
+# Copy the rows you want into ~/.config/drover/drover.toml (or author them with
+# `drover action`). Every action parks a run at hold — you release it from corral
+# or `drover` — unless it sets auto = true.
+#
+# shepherd is trigger-only as a SOURCE: the drover loop only reads the board to
+# sense changes, never writes to it. A released agent is a different matter — it
+# runs with real tools in {{dir}} and can absolutely edit the board (e.g. call
+# `shepherd`) if its prompt tells it to. Keep that in mind when writing a `do`.
+# {{field}} in a `do` (or `target`) is filled from the event's data; available
+# fields are listed above each action.
+
+# --- source -----------------------------------------------------------------
+# Watches the default board. Add `--all` to cmd to watch every board, or
+# `--board NAME` for a specific one. Each board's working directory rides along
+# in every event as {{dir}}, so an action can run the agent in that board's repo.
+[[source]]
+name = "shepherd"
+cmd = ["drover", "source", "shepherd"]
+types = ["shepherd.added", "shepherd.updated", "shepherd.removed", "shepherd.archived"]
+
+# --- runner ------------------------------------------------------------------
+[[runner]]
+name = "claude"
+cmd = [
+	"claude",
+	"-p",
+	"{{prompt}}",
+	"--permission-mode",
+	"{{mode}}",
+	"--output-format",
+	"stream-json",
+	"--verbose",
+]
+modes = ["bypassPermissions", "acceptEdits"]
+
+# --- actions ----------------------------------------------------------------
+
+# fields: title, subject, item_id, board, url, note, dir
+# A new todo lands → do it in that board's own directory.
+[[action]]
+name = "on-new-todo"
+on = "shepherd.added"
+runner = "claude"
+mode = "acceptEdits"
+target = "{{dir}}"
+do = "A task was added to the \"{{board}}\" board: {{title}}. Notes: {{note}}. Reference: {{url}}. Carry it out in this directory; if it is not actionable by an agent, say so and stop."
+
+# fields: title, subject, item_id, board, url, note, dir
+# A todo was edited → re-read it and continue.
+[[action]]
+name = "on-todo-edit"
+on = "shepherd.updated"
+runner = "claude"
+mode = "acceptEdits"
+target = "{{dir}}"
+do = "The task \"{{title}}\" on board \"{{board}}\" changed. Notes: {{note}}. Reconcile the work in this directory with the new intent."

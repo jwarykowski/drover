@@ -1,6 +1,6 @@
-// Command drover runs the loop around a shepherd board. Subcommands: watch
-// (the closed loop), action (author the registry), run (fire an allowlisted
-// action), doctor (prove the boundary).
+// Command drover runs the sense → match → act loop. Subcommands: watch (the
+// closed loop), action (author drover.toml), source (the built-in source
+// plugins), doctor (check the wiring).
 package main
 
 import (
@@ -12,14 +12,14 @@ import (
 	"os"
 	osexec "os/exec"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/charmbracelet/x/term"
-	"github.com/jwarykowski/drover/exec"
+	"github.com/jwarykowski/drover/config"
+	"github.com/jwarykowski/drover/daemon"
 	"github.com/jwarykowski/drover/loop"
-	"github.com/jwarykowski/drover/registry"
 	"github.com/jwarykowski/drover/store"
 	"github.com/jwarykowski/drover/tui"
 )
@@ -29,7 +29,7 @@ func main() {
 	// prints usage instead of trying to draw a TUI.
 	if len(os.Args) < 2 {
 		if term.IsTerminal(os.Stdin.Fd()) {
-			if err := tui.Dashboard(registry.DefaultPath()); err != nil {
+			if err := tui.Dashboard(config.DefaultPath()); err != nil {
 				fmt.Fprintln(os.Stderr, "drover:", err)
 				os.Exit(1)
 			}
@@ -43,12 +43,12 @@ func main() {
 	switch os.Args[1] {
 	case "doctor":
 		err = doctor(ctx, os.Args[2:])
-	case "run":
-		err = runAction(ctx, os.Args[2:])
 	case "watch":
 		err = watch(ctx, os.Args[2:])
 	case "action":
 		err = actionCmd(os.Args[2:])
+	case "source":
+		err = sourceCmd(ctx, os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("drover", tui.Version) // tui.Version is the single source of truth
 	case "help", "--help", "-h":
@@ -65,57 +65,48 @@ func main() {
 
 func usage() { fmt.Fprintln(os.Stderr, usageText) }
 
-const usageText = `drover — the sense→assemble→act loop around a shepherd board
+const usageText = `drover — the sense→match→act loop
 
 Usage:
-  drover                  open the interactive dashboard (board + watch control)
+  drover                  open the interactive dashboard (lanes + watch control)
   drover <command> [flags]
 
 Commands:
-  watch      sense GitHub + the board and drive the loop
-  action     author the trusted action registry (opens a TUI)
-  run        fire an allowlisted command directly
-  doctor     prove the shepherd boundary (read the board, add a probe)
+  watch      run every configured source and drive the loop
+  action     author the actions in drover.toml (opens a TUI)
+  source     run a built-in source plugin (github | shepherd)
+  doctor     check the config: sources, agents and their binaries
   version    print the version and exit
   help       print this help
 
-watch:  (needs no flags — repos are derived from the registry)
-  --repo owner/name       repo to watch (optional; else every repo named by a github.* action)
-  --board <board>       shepherd board to park tasks on
-  --source forward|poll   GitHub sense mode (default forward)
+watch:  (needs no flags — everything comes from drover.toml)
+  --config <path>         config file (default ~/.config/drover/drover.toml)
   --agents <n>            agent runs allowed in parallel (default 1)
   --seen <file>           persist handled event ids across restarts
   --provenance <file>     also tee the per-agent-run JSON trace to a file
 
 stdout carries the structured per-agent-run JSON trace; stderr the operational log.
-  --registry <path>       action registry (default ~/.config/drover/actions.toml)
 
 action:
   (bare)                  interactive TUI: create/view/edit/delete actions
-  add|list|edit|rm        scriptable registry management
+  add|list|edit|rm        scriptable action management
 
-run <name>:
-  --arg key=value         substitute into the allowlisted command (repeatable)
-  --yes                   skip the confirm prompt
-  --config <path>         allowlist file (default config/config.toml)
+source: run a source plugin, writing NDJSON events to stdout. Normally spawned
+by watch through a [[source]] row rather than by hand.
+  drover source github --repo owner/name [--mode poll|forward] [--base branch]
+  drover source shepherd [--board name] [--all]
 
-Runtime needs shepherd, gh and claude on PATH.`
+A source is any process that writes drover's event envelope to stdout, or any
+service that POSTs it to a [[source]] http address — these two ship in the box.`
 
-// watch runs the closed loop over all configured sources: sense GitHub (+ the
-// board), match each event against the trusted registry to park a held agentic
-// task, and when a human releases one fire its registered agent action and
-// reconcile the task from the agent's verdict. The GitHub sense is push (`gh
-// webhook forward`) by default, poll as a fallback; both dedup on event id.
+// watch runs the closed loop: every configured source streams events, each
+// event is matched against the actions in drover.toml, a match parks a run, and
+// once released (by a human, or immediately for an action marked auto) the
+// action's agentic tool runs and its verdict reconciles the task.
 func watch(ctx context.Context, argv []string) error {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
-	repo := fs.String("repo", "", "GitHub repo to watch, owner/name (optional; else derived from the registry)")
-	base := fs.String("base", "master", "branch whose merges are sensed (poll mode)")
-	board := fs.String("board", "", "shepherd board to park tasks on")
-	sourceMode := fs.String("source", "forward", "GitHub sense: forward (gh webhook forward) | poll")
-	addr := fs.String("addr", "127.0.0.1:9099", "local bind for the webhook receiver (forward mode)")
-	interval := fs.Duration("interval", time.Minute, "GitHub poll interval (poll mode)")
+	cfgPath := fs.String("config", config.DefaultPath(), "path to drover.toml")
 	seenPath := fs.String("seen", "", "file recording handled event ids (survives restarts)")
-	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
 	provPath := fs.String("provenance", "", "also append the per-agent-run JSON records to this file (they always stream to stdout)")
 	agents := fs.Int("agents", 1, "number of agent runs to allow in parallel")
 	fs.Parse(argv)
@@ -137,23 +128,35 @@ func watch(ctx context.Context, argv []string) error {
 		provW = io.MultiWriter(os.Stdout, f)
 	}
 
-	cfg := tui.Config{
-		Repo:     *repo,
-		Base:     *base,
-		Board:    *board,
-		Source:   *sourceMode,
-		Addr:     *addr,
-		Interval: *interval,
-		SeenPath: *seenPath,
-		RegPath:  *regPath,
-		Agents:   *agents,
-	}
-	return tui.RunDaemon(ctx, cfg, provW, logger.Printf)
+	return daemon.Run(ctx, daemon.Config{
+		ConfigPath: *cfgPath,
+		SeenPath:   *seenPath,
+		Agents:     *agents,
+	}, provW, logger.Printf)
 }
 
-// actionCmd is the CRUD UI over the trusted registry: `drover action
-// add|list|edit|rm`. This is the only writer of the registry the board
-// references, so it is where events bind to what an agent does.
+// sourceCmd runs one of the source plugins that ship in this binary. They have
+// no privileged path into drover — watch spawns them through the same
+// ExecSource any third-party plugin gets.
+func sourceCmd(ctx context.Context, argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("source: missing plugin name (github | shepherd)")
+	}
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	switch argv[0] {
+	case "github":
+		return sourceGitHub(ctx, argv[1:])
+	case "shepherd":
+		return sourceShepherd(ctx, argv[1:])
+	default:
+		return fmt.Errorf("source: unknown plugin %q (want github or shepherd)", argv[0])
+	}
+}
+
+// actionCmd is the CRUD UI over the actions in drover.toml. This is the only
+// writer of the actions an event can select, so it is where events bind to what
+// an agent does.
 func actionCmd(argv []string) error {
 	// Bare `drover action` (or with only flags) opens the interactive TUI; the
 	// flag verbs stay for scripting.
@@ -175,38 +178,61 @@ func actionCmd(argv []string) error {
 	}
 }
 
-// actionTUI opens the interactive registry manager. It needs a terminal; when
+// actionTUI opens the interactive action manager. It needs a terminal; when
 // stdin isn't one (piped/CI), it prints the scriptable usage instead of crashing.
 func actionTUI(argv []string) error {
 	fs := flag.NewFlagSet("action", flag.ExitOnError)
-	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	cfgPath := fs.String("config", config.DefaultPath(), "path to drover.toml")
 	fs.Parse(argv)
 	if !term.IsTerminal(os.Stdin.Fd()) {
 		fmt.Fprintln(os.Stderr, "usage: drover action <add|list|edit|rm> [flags]  (bare `drover action` opens the TUI on a terminal)")
 		return fmt.Errorf("action: not a terminal")
 	}
-	return tui.Run(*regPath)
+	return tui.Run(*cfgPath)
+}
+
+// whereFlag collects repeated --where key=value filters.
+type whereFlag map[string]string
+
+func (m whereFlag) String() string { return "" }
+func (m whereFlag) Set(kv string) error {
+	k, v, ok := strings.Cut(kv, "=")
+	if !ok {
+		return fmt.Errorf("expected key=value, got %q", kv)
+	}
+	m[k] = v
+	return nil
 }
 
 func actionAdd(argv []string) error {
 	fs := flag.NewFlagSet("action add", flag.ExitOnError)
-	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	cfgPath := fs.String("config", config.DefaultPath(), "path to drover.toml")
 	name := fs.String("name", "", "friendly label (required)")
 	on := fs.String("on", "", "event type to match (required)")
-	repo := fs.String("repo", "", "optional source repo filter, owner/name")
-	target := fs.String("target", "", "directory the agent runs in (required)")
-	mode := fs.String("mode", "acceptEdits", "claude permission mode")
+	runner := fs.String("runner", "", "runner to invoke; empty uses the first [[runner]]")
+	target := fs.String("target", "", "directory the runner runs in; may template {{key}} from event data")
+	mode := fs.String("mode", "", "permission mode passed to the runner")
+	auto := fs.Bool("auto", false, "fire without waiting for a human release")
 	doFile := fs.String("do-file", "", "read the prompt body from this file instead of $EDITOR")
+	where := whereFlag{}
+	fs.Var(where, "where", "event data filter, key=value (repeatable)")
 	fs.Parse(argv)
 
-	if *name == "" || *on == "" || *target == "" {
-		return fmt.Errorf("action add: --name, --on and --target are required")
+	if *name == "" || *on == "" {
+		return fmt.Errorf("action add: --name and --on are required")
 	}
-	if !registry.ValidType(*on) {
-		return fmt.Errorf("action add: unknown event type %q; known: %s", *on, strings.Join(registry.KnownEventTypes, ", "))
+	cf, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
 	}
-	if !registry.ValidMode(*mode) {
-		return fmt.Errorf("action add: invalid mode %q; valid: %s", *mode, strings.Join(registry.ValidModes, ", "))
+	if _, err := cf.RunnerByName(*runner); err != nil {
+		return fmt.Errorf("action add: %w", err)
+	}
+	if !cf.ValidMode(*runner, *mode) {
+		return fmt.Errorf("action add: mode %q is not one this runner accepts", *mode)
+	}
+	if known := cf.Types(); len(known) > 0 && !slices.Contains(known, *on) {
+		fmt.Fprintf(os.Stderr, "note: no configured source declares %q (declared: %s)\n", *on, strings.Join(known, ", "))
 	}
 	do, err := promptBody(*doFile)
 	if err != nil {
@@ -216,32 +242,44 @@ func actionAdd(argv []string) error {
 		return fmt.Errorf("action add: empty prompt body")
 	}
 
-	reg, err := registry.Load(*regPath)
-	if err != nil {
+	a := config.Action{Name: *name, On: *on, Where: where, Runner: *runner, Target: *target, Mode: *mode, Auto: *auto, Do: do}
+	warnRisky(a)
+	saved, _ := cf.Add(a)
+	if err := cf.Save(); err != nil {
 		return err
 	}
-	a, _ := reg.Add(registry.Action{Name: *name, On: *on, Repo: *repo, Target: *target, Mode: *mode, Do: do})
-	if err := reg.Save(); err != nil {
-		return err
-	}
-	fmt.Printf("added action %s (%s)\n", a.ID, a.Name)
+	fmt.Printf("added action %s (%s)\n", saved.ID, saved.Name)
 	return nil
+}
+
+// warnRisky says plainly what an unattended, permission-waiving action means.
+// It warns rather than refuses: on a source whose content nobody outside the
+// operator can write, it is a reasonable thing to want.
+func warnRisky(a config.Action) {
+	if !a.Risky() {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"warning: action %q runs unattended (auto) in mode %q, so an agent with file system access\n"+
+			"         acts on event text drover did not author. Only do this for a source whose\n"+
+			"         content you control end to end.\n", a.Name, a.Mode)
 }
 
 func actionList(argv []string) error {
 	fs := flag.NewFlagSet("action list", flag.ExitOnError)
-	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	cfgPath := fs.String("config", config.DefaultPath(), "path to drover.toml")
 	fs.Parse(argv)
-	reg, err := registry.Load(*regPath)
+	cf, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
-	if len(reg.Actions) == 0 {
-		fmt.Println("no actions registered")
+	actions := cf.Actions()
+	if len(actions) == 0 {
+		fmt.Println("no actions configured")
 		return nil
 	}
-	fmt.Println("id        name  on  repo")
-	for _, a := range reg.Actions {
+	fmt.Println("id        name  on  where  agent")
+	for _, a := range actions {
 		fmt.Println(a.Summary())
 	}
 	return nil
@@ -253,37 +291,55 @@ func actionEdit(argv []string) error {
 	}
 	id, rest := argv[0], argv[1:]
 	fs := flag.NewFlagSet("action edit", flag.ExitOnError)
-	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	cfgPath := fs.String("config", config.DefaultPath(), "path to drover.toml")
 	name := fs.String("name", "", "new label")
-	repo := fs.String("repo", "", "new repo filter")
+	runner := fs.String("runner", "", "new runner")
 	target := fs.String("target", "", "new target directory")
 	mode := fs.String("mode", "", "new permission mode")
 	doFile := fs.String("do-file", "", "replace the prompt body from this file")
 	editDo := fs.Bool("do", false, "replace the prompt body in $EDITOR")
+	auto := fs.String("auto", "", "true|false — fire without a human release")
+	where := whereFlag{}
+	fs.Var(where, "where", "replace the event data filter, key=value (repeatable)")
 	fs.Parse(rest)
 
-	reg, err := registry.Load(*regPath)
+	cf, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
-	a, ok := reg.ByID(id)
+	a, ok := cf.ByID(id)
 	if !ok {
-		return fmt.Errorf("action edit: %w", registry.ErrNotFound)
+		return fmt.Errorf("action edit: %w: %s", config.ErrNotFound, id)
 	}
 	if *name != "" {
 		a.Name = *name
 	}
-	if *repo != "" {
-		a.Repo = *repo
+	if *runner != "" {
+		if _, err := cf.RunnerByName(*runner); err != nil {
+			return fmt.Errorf("action edit: %w", err)
+		}
+		a.Runner = *runner
 	}
 	if *target != "" {
 		a.Target = *target
 	}
 	if *mode != "" {
-		if !registry.ValidMode(*mode) {
-			return fmt.Errorf("action edit: invalid mode %q", *mode)
+		if !cf.ValidMode(a.Runner, *mode) {
+			return fmt.Errorf("action edit: mode %q is not one runner %q accepts", *mode, a.Runner)
 		}
 		a.Mode = *mode
+	}
+	if len(where) > 0 {
+		a.Where = where
+	}
+	switch *auto {
+	case "true":
+		a.Auto = true
+	case "false":
+		a.Auto = false
+	case "":
+	default:
+		return fmt.Errorf("action edit: --auto wants true or false, got %q", *auto)
 	}
 	if *doFile != "" || *editDo {
 		src := *doFile
@@ -296,10 +352,11 @@ func actionEdit(argv []string) error {
 		}
 		a.Do = do
 	}
-	_ = reg.Remove(id)
-	a.ID = id
-	reg.Actions = append(reg.Actions, a)
-	if err := reg.Save(); err != nil {
+	warnRisky(a)
+	if err := cf.Replace(a); err != nil {
+		return err
+	}
+	if err := cf.Save(); err != nil {
 		return err
 	}
 	fmt.Printf("updated action %s\n", id)
@@ -312,16 +369,16 @@ func actionRm(argv []string) error {
 	}
 	id, rest := argv[0], argv[1:]
 	fs := flag.NewFlagSet("action rm", flag.ExitOnError)
-	regPath := fs.String("registry", registry.DefaultPath(), "path to the action registry")
+	cfgPath := fs.String("config", config.DefaultPath(), "path to drover.toml")
 	fs.Parse(rest)
-	reg, err := registry.Load(*regPath)
+	cf, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
-	if err := reg.Remove(id); err != nil {
+	if err := cf.Remove(id); err != nil {
 		return err
 	}
-	if err := reg.Save(); err != nil {
+	if err := cf.Save(); err != nil {
 		return err
 	}
 	fmt.Printf("removed action %s\n", id)
@@ -354,100 +411,107 @@ func promptBody(file string) (string, error) {
 	return string(b), err
 }
 
-// argMap collects repeated --arg key=value flags.
-type argMap map[string]string
+// doctor reports what drover is wired to and whether it can actually run it:
+// every source's transport and binary, every agent's binary, every action's
+// bindings, and the task store. It changes nothing.
+func doctor(ctx context.Context, argv []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	cfgPath := fs.String("config", config.DefaultPath(), "path to drover.toml")
+	fs.Parse(argv)
 
-func (m argMap) String() string { return "" }
-func (m argMap) Set(kv string) error {
-	k, v, ok := strings.Cut(kv, "=")
-	if !ok {
-		return fmt.Errorf("expected key=value, got %q", kv)
-	}
-	m[k] = v
-	return nil
-}
-
-// runAction explicitly fires an allowlisted named action:
-//
-//	drover run fix-ci --arg repo=acme/api --arg task="fix the failing run" [--yes]
-//
-// The action name must be in the config allowlist; args fill the config command
-// template. Nothing from a shepherd board is involved, so this can only run what
-// trusted config permits.
-func runAction(ctx context.Context, argv []string) error {
-	if len(argv) == 0 {
-		return fmt.Errorf("run: missing action name")
-	}
-	name, rest := argv[0], argv[1:]
-
-	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	configPath := fs.String("config", "config/config.toml", "path to drover's action allowlist")
-	reason := fs.String("reason", "manual invocation", "why this action is firing (recorded)")
-	yes := fs.Bool("yes", false, "skip the confirmation prompt for confirm=true actions")
-	provPath := fs.String("provenance", "", "append a JSON provenance record to this file")
-	args := argMap{}
-	fs.Var(args, "arg", "key=value substituted into the action command (repeatable)")
-	fs.Parse(rest)
-
-	allow, err := exec.LoadAllowlist(*configPath)
+	cf, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
+	fmt.Printf("config: %s\n", *cfgPath)
 
-	var prov *os.File
-	if *provPath != "" {
-		prov, err = os.OpenFile(*provPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			return err
+	problems := 0
+	sources := cf.Sources()
+	fmt.Printf("\nsources (%d):\n", len(sources))
+	if len(sources) == 0 {
+		fmt.Println("  none — drover will only react to its own tasks")
+	}
+	for _, s := range sources {
+		switch {
+		case len(s.Cmd) > 0 && s.HTTP != "":
+			fmt.Printf("  ✗ %-14s sets both cmd and http; it will be skipped\n", s.Name)
+			problems++
+		case len(s.Cmd) > 0:
+			mark, bad := lookMark(s.Cmd[0])
+			problems += bad
+			fmt.Printf("  %s %-14s exec  %s\n", mark, s.Name, strings.Join(s.Cmd, " "))
+		case s.HTTP != "":
+			fmt.Printf("  ✓ %-14s http  %s/events\n", s.Name, s.HTTP)
+		default:
+			fmt.Printf("  ✗ %-14s sets neither cmd nor http; it will be skipped\n", s.Name)
+			problems++
 		}
-		defer prov.Close()
+		if len(s.Types) > 0 {
+			fmt.Printf("    emits: %s\n", strings.Join(s.Types, ", "))
+		}
 	}
 
-	x := exec.RunnerExecutor{
-		Allow:      allow,
-		Provenance: prov,
-		Confirm: func(a loop.RunAction, s exec.ActionSpec) bool {
-			if *yes {
-				return true
-			}
-			return confirmTTY(a, s)
-		},
+	runners := cf.RunnerNames()
+	fmt.Printf("\nrunners (%d):\n", len(runners))
+	if len(runners) == 0 {
+		fmt.Println("  ✗ none — every action will fail to run")
+		problems++
 	}
-	return x.Apply(ctx, []loop.Action{loop.RunAction{Name: name, Args: args, Reason: *reason}})
-}
+	for _, name := range runners {
+		g, _ := cf.RunnerByName(name)
+		if len(g.Cmd) == 0 {
+			fmt.Printf("  ✗ %-14s has an empty cmd\n", name)
+			problems++
+			continue
+		}
+		mark, bad := lookMark(g.Cmd[0])
+		problems += bad
+		fmt.Printf("  %s %-14s %s\n", mark, name, strings.Join(g.Cmd, " "))
+	}
 
-// confirmTTY prompts on stderr and reads a y/N answer from stdin.
-func confirmTTY(a loop.RunAction, s exec.ActionSpec) bool {
-	fmt.Fprintf(os.Stderr, "run %q %v ? [y/N] ", a.Name, s.Cmd)
-	var ans string
-	fmt.Fscanln(os.Stdin, &ans)
-	ans = strings.ToLower(strings.TrimSpace(ans))
-	return ans == "y" || ans == "yes"
-}
-
-// doctor proves the boundary: read the real board, then add a marked throwaway.
-func doctor(ctx context.Context, argv []string) error {
-	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
-	fs.Parse(argv)
+	actions := cf.Actions()
+	fmt.Printf("\nactions (%d):\n", len(actions))
+	declared := cf.Types()
+	for _, a := range actions {
+		flags := ""
+		if a.Auto {
+			flags = "  [auto]"
+		}
+		fmt.Printf("  %-8s %-14s on %s%s\n", a.ID, a.Name, a.On, flags)
+		if _, err := cf.RunnerByName(a.Runner); err != nil {
+			fmt.Printf("    ✗ %v\n", err)
+			problems++
+		}
+		if len(declared) > 0 && !slices.Contains(declared, a.On) {
+			fmt.Printf("    ! no configured source declares %q\n", a.On)
+		}
+		if a.Risky() {
+			fmt.Printf("    ! runs unattended in %s — an agent acts on event text with no human gate\n", a.Mode)
+		}
+	}
 
 	st, err := store.OpenFileStore(store.DefaultTasksPath())
 	if err != nil {
 		return err
 	}
-	items, err := st.List(ctx, loop.Filter{})
+	tasks, err := st.List(ctx, loop.Filter{})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("task store has %d open task(s):\n", len(items))
-	for _, it := range items {
-		fmt.Printf("  [%s] %s\n", it.ID, it.Text)
-	}
+	fmt.Printf("\ntasks: %d open in %s\n", len(tasks), store.DefaultTasksPath())
 
-	// Leaves the probe task behind; remove it by editing tasks.json.
-	added, err := st.Add(ctx, loop.Spec{Text: "drover doctor probe", Category: "drover", Priority: "L"})
-	if err != nil {
-		return err
+	if problems > 0 {
+		return fmt.Errorf("doctor: %d problem(s) found", problems)
 	}
-	fmt.Printf("added probe: [%s] %s\n", added.ID, added.Text)
+	fmt.Println("\nall good")
 	return nil
+}
+
+// lookMark reports whether a command resolves on PATH, returning the tick and
+// how much it adds to the problem count.
+func lookMark(bin string) (string, int) {
+	if _, err := osexec.LookPath(bin); err != nil {
+		return "✗", 1
+	}
+	return "✓", 0
 }

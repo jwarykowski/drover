@@ -7,14 +7,12 @@
 
 # 🐕 drover
 
-> drives the flock the shepherd tends.
+> drives the flock, whoever tends it.
 
-drover is the sense → assemble-context → act loop **around**
-[shepherd](https://github.com/jwarykowski/shepherd). shepherd stays the dumb,
-safe blackboard that owns the todo file; drover senses events, reads the
-relevant slice of the board, decides, and — when allowed — acts. **It only ever
-speaks shepherd's CLI, never the file.** Keep that line clean and everything
-else stays swappable.
+drover is the sense → match → act loop. A **source** ingests events over one
+small protocol, an **action** matches one, and whichever **agentic tool** that
+action names runs against it. Sources are separate processes, so adding one is a
+config row — drover never learns what GitHub, Sentry or a todo board *is*.
 
 </td>
 </tr>
@@ -22,280 +20,356 @@ else stays swappable.
 
 - [quickstart](#quickstart)
 - [status](#status)
-- [the boundary](#the-boundary)
-- [the seams](#the-seams)
+- [the shape](#the-shape)
+- [the event protocol](#the-event-protocol)
+- [writing a source](#writing-a-source)
+- [agentic tools](#agentic-tools)
+- [config](#config)
 - [how it works](#how-it-works)
 - [layout](#layout)
-- [trusted config](#trusted-config)
 - [build](#build)
 - [usage](#usage)
 - [design principles](#design-principles)
-- [non-goals (v1)](#non-goals-v1)
+- [non-goals](#non-goals)
 
 ## quickstart
 
 ```sh
-# 1. teach drover what to do when a PR merges (interactive: type→subaction,
-#    seeded prompt; sets the repo + target the agent runs in)
+# 1. tell drover what to ingest and what to run (see config below)
+$EDITOR ~/.config/drover/drover.toml
+
+# 2. check the wiring: transports, binaries, actions
+drover doctor
+
+# 3. teach drover what to do when an event lands
 drover action
 
-# 2. sense and drive the loop — repos come from the registry, no flags needed
+# 4. sense and drive the loop
 drover watch
 ```
 
-3. A PR merges → drover parks **one held task** on the board. Open it in
-   shepherd, flip its status `hold → go`, and the agent runs in the action's
-   target dir, marking the task done from its verdict — each run logged as a
-   JSON line on stdout. Nothing runs until you release it.
+An event lands → drover parks **one held run**. Open the dashboard, flip it
+`hold → go`, and the action's agentic tool runs in its target directory, marking
+the run done from its verdict — each run logged as a JSON line on stdout.
+Nothing runs until you release it, unless the action opts into `auto`.
 
-That's the whole loop. Or skip the flags entirely: run **`drover`** for an
-interactive dashboard — pick the board and start/stop watching. Move across the
+Or skip the flags: run **`drover`** for the dashboard. Move across the
 held/running/done lanes with the arrow keys (or `j`/`k`), `g` to release a held
-run, `x` to delete one, `l` for the full-window daemon trace, and `d` (or
-`enter`) to open a job's **detail view** — its verdict and status, with `l`
-opening the agent's full conversation log (tailed live, persisted at
-`~/.config/drover/logs/<task-id>.jsonl`), `r` to restart the run and `x` to
-delete it. Keys mirror shepherd's (`d` detail, `x` delete). `drover doctor`
-first if you want to prove the boundary before wiring anything up.
+run, `x` to delete one, `b` to filter by source, `l` for the full-window daemon
+trace, and `d` (or `enter`) for a run's **detail view** — its verdict and status,
+with `l` opening the agent's full conversation log (tailed live, persisted at
+`~/.config/drover/logs/<task-id>.jsonl`), `r` to restart and `x` to delete.
 
 ## status
 
-Works end to end — sensing (GitHub PRs, board changes), the
-`hold → go` review gate, the allowlisted agent run, and reconcile-from-verdict.
-Each step sits behind a clean seam; see [how it works](#how-it-works).
+Works end to end: both transports, the `hold → go` review gate, the agent run,
+and reconcile-from-verdict. Every step sits behind a seam; see
+[how it works](#how-it-works).
 
-## the boundary
+## the shape
 
-drover never touches the todo markdown. It speaks shepherd's CLI contract:
-stable item ids, `--json` on every mutating verb, structured errors, and `watch`
-(NDJSON). `store/shepherd.go` is the **only** file that knows shepherd exists —
-the loop sees just interfaces, so shepherd is one swappable `Store`.
-
-## the seams
-
-The loop is a handful of interfaces; everything else is an implementation behind
-one.
-
-```go
-type Source    interface{ Events(ctx) <-chan Event }                    // sense
-type Assembler interface{ Assemble(ctx, Event) (Context, error) }       // attend
-type Store     interface{ List / Add / SetStatus / Note / Archive }     // read + write
-type Policy    interface{ Decide(ctx, Context) []Action }               // think
-type Executor  interface{ Apply(ctx, []Action) error }                  // act
+```
+source (exec | http) → event → match action → run named agent → verdict → reconcile
 ```
 
-`Loop.Run`: **event in → assemble the attention slice → decide actions →
-apply.** The loop imports only these interfaces — swap `ShepherdStore` for
-`FakeStore` and it can't tell.
+Five interfaces, and everything else is an implementation behind one:
 
-Every event carries a sealed `Payload`: a `Signal` (something happened upstream
-— repo, title, url) or a `BoardChange` (a shepherd item that changed). A policy
-switches on the concrete shape, never on raw gh/Sentry JSON.
+```go
+type Source    interface{ Events(ctx) <-chan Event }                // ingest
+type Assembler interface{ Assemble(ctx, Event) (Context, error) }   // attend
+type Store     interface{ List / Add / SetStatus / Note / Archive } // track
+type Policy    interface{ Decide(ctx, Context) []Action }           // think
+type Executor  interface{ Apply(ctx, []Action) error }              // act
+```
+
+There is exactly one event shape. It is an open map on purpose — a source is a
+separate process and cannot add a Go type, so every closed vocabulary would be a
+reason to recompile drover:
+
+```go
+type Event struct {
+	ID, Type, Source string
+	At               time.Time
+	Data             map[string]string // whatever the source sent
+}
+```
 
 Actions are a closed vocabulary — a policy proposes, an executor validates and
 applies:
 
 | Action | Effect |
 | --- | --- |
-| `AddTask` | create an item (idempotent by link) |
-| `SetStatus` | transition an item by id (e.g. → `running`, `done`) |
-| `RunAgent` | run an agent action from the trusted **registry**, by id |
-| `RunAction` | fire a named command from the trusted **allowlist** |
+| `AddTask` | park a run (one per subject+action at a time) |
+| `SetStatus` | transition a run by id (e.g. → `running`, `done`) |
+| `RunAgent` | run an action from the trusted config, **by id** |
+
+## the event protocol
+
+One JSON object per line. Only `id` and `type` are required.
+
+```json
+{"id":"github/acme/api:pr:12:merged","type":"github.pull_request.merged",
+ "source":"acme-api","at":"2026-07-30T09:00:00Z",
+ "data":{"repo":"acme/api","title":"fix login","url":"https://…","subject":"https://…"}}
+```
+
+`id` must be unique **per logical event**, not per subject: two edits to the
+same item are two events and need two ids, or drover's dedup swallows the second
+one forever.
+
+`data` is free-form — actions filter on it, prompts render it, targets template
+from it — but three keys are conventional, because drover itself reads them:
+
+| key | meaning |
+| --- | --- |
+| `title` | what the run is called in the lanes |
+| `url` | a link a human can open |
+| `subject` | a **stable** id for the thing this event concerns (a PR url, a board item id, an issue key). While a run for a subject is in flight, further events about that subject don't park a second one. Falls back to `url`, then to the event id. |
+
+Anything else you send reaches the prompt and the action filters untouched.
+
+## writing a source
+
+A source is **any process that writes those lines to stdout**, or any service
+that POSTs them. No linking, no ABI, any language.
+
+```sh
+#!/bin/sh
+# the whole contract
+while read -r line; do
+  printf '{"id":"tail:%s","type":"log.error","data":{"title":"%s","subject":"errlog"}}\n' \
+    "$(date +%s%N)" "$line"
+done
+```
+
+```toml
+[[source]]
+name  = "errlog"
+cmd   = ["./tail-errors.sh"]
+types = ["log.error"]          # optional: populates the action editor's picker
+```
+
+drover spawns it, reads its stdout, restarts it if it dies, and dedups on event
+id. Its stderr is yours for diagnostics. For a remote source, set
+`http = "127.0.0.1:9100"` instead and POST the same body to `/events` —
+downstream, an action cannot tell which transport raised an event.
+
+**drover's own GitHub and shepherd sources are exactly this** —
+`drover source github` and `drover source shepherd` are ordinary plugins
+spawned through the same path, with no privileged route in. That is the proof
+the contract is real.
+
+## runners
+
+A runner is an argv template. `{{prompt}}` receives the built prompt and
+`{{mode}}` the action's permission mode; a tool with no permission concept just
+omits it. Adding a second tool is a config row, not a release:
+
+```toml
+[[runner]]
+name  = "claude"
+cmd   = ["claude", "-p", "{{prompt}}", "--permission-mode", "{{mode}}",
+         "--output-format", "stream-json", "--verbose"]
+modes = ["bypassPermissions", "acceptEdits"]
+
+[[runner]]
+name = "codex"
+cmd  = ["codex", "exec", "--full-auto", "{{prompt}}"]
+```
+
+Each action names the runner it wants (`runner = "codex"`; empty takes the first).
+`modes` is that tool's own vocabulary — the action editor offers exactly those,
+and a runner declaring none accepts anything, since drover can't know a
+third-party tool's flags.
+
+No per-tool output parser is needed. drover looks for a trailing verdict two
+ways: a `{"type":"result",…}` streaming event, then the last `{…}` line of
+stdout. That covers both common shapes.
+
+```json
+{"status":"done|failed|blocked","summary":"…","followups":["task text"]}
+```
+
+`done` notes the summary, stamps the run done and archives it. Anything else
+leaves it `running` with a note, for you to look at. Followups become plain
+tasks. drover never executes a string the agent returns.
+
+## config
+
+One file, `~/.config/drover/drover.toml`, holding three tables. It is the only
+trusted store: an event can at most *select* an action that already exists here,
+and every command body — a source's argv, a runner's argv — lives here alone.
+
+```toml
+[[source]]
+name  = "shepherd"
+cmd   = ["drover", "source", "shepherd"]
+types = ["shepherd.added", "shepherd.updated", "shepherd.removed", "shepherd.archived"]
+
+[[source]]
+name  = "acme-api"
+cmd   = ["drover", "source", "github", "--repo", "acme/api"]
+types = ["github.pull_request.merged", "github.issues.opened"]
+
+[[source]]
+name = "sentry"
+http = "127.0.0.1:9100"
+
+[[runner]]
+name  = "claude"
+cmd   = ["claude", "-p", "{{prompt}}", "--permission-mode", "{{mode}}",
+         "--output-format", "stream-json", "--verbose"]
+modes = ["bypassPermissions", "acceptEdits"]
+
+[[action]]
+id     = "019f81be"                # assigned by `drover action`
+name   = "fix-ci"
+on     = "github.pull_request.merged"
+where  = { repo = "acme/api" }     # match ANY event data key, not just repo
+runner = "claude"
+mode   = "acceptEdits"
+target = "~/src/acme-api"          # templated: "{{dir}}", "~/src/{{repo}}"
+auto   = false                     # true skips the human gate — read below
+do     = "A PR merged. If CI on main is red, open a fix PR."
+```
+
+`target` templates from event data, which is how an action follows its event
+without drover resolving anything source-specific: the shepherd source puts the
+board's working directory in `dir`, so `target = "{{dir}}"` runs the runner
+there. A placeholder the event never carried is a hard error — running somewhere
+unintended is worse than failing.
+
+Actions are normally managed by `drover action`, not hand-edited. Sources and
+runners are yours to write.
+
+### the `auto` flag
+
+`auto = true` runs an agentic tool with file system access on event text, with
+no human in the loop. On a source whose text an outsider can write — a GitHub
+issue title, a Sentry message — that is a prompt-injection path straight to code
+execution. It defaults to `false`, `drover action` warns when it is paired with
+a permission-waiving mode, and `drover doctor` flags it. Use it only for a
+source whose content you control end to end.
 
 ## how it works
 
-Two flows converge on one park → release → dispatch → reconcile path in the
-`FileStore`. They differ only in what parks the task: an upstream signal or a
-board change. Both park at `hold` and wait for a human to release them.
-shepherd is only ever read.
-
-**1. upstream signal → held task → human gate → agent run**
-
 ```
-PR merged / issue opened
-  → Ingress matches the event (type [+ repo]) against the registry
-  → parks ONE held agentic task per match, carrying the action's id
-  → a human flips hold → go in shepherd            # the review gate
-  → board.updated → Dispatcher claims `running` + emits RunAgent
-  → AgentExecutor resolves the id, runs `claude` in the action's target repo
-  → reconciles the task (done / left running) from the agent's verdict
+event lands (exec plugin stdout, or an HTTP POST)
+  → Dedup drops it if that event id was already handled
+  → Policy matches type + where against the config
+  → parks ONE held run per matching action, carrying the action's id
+  → a human flips hold → go in the dashboard            # the review gate
+  → the task store re-drives itself; Policy claims `running` + emits RunAgent
+  → AgentExecutor resolves the action, resolves its agent, renders the argv,
+    runs it in the templated target directory
+  → reconciles the run (done → archived / left running) from the verdict
 ```
 
-The hold→go gate is the whole safety story: an agent never runs on untrusted
-event text until a human releases it.
+An `auto` action parks straight at `go` instead of `hold`, so the same re-drive
+dispatches it on the next tick — one path, not two.
 
-**2. board change → held task → human gate → agent run (shepherd is trigger-only)**
-
-```
-board.{added,updated,removed,archived}   # from `shepherd watch`
-  → BoardTrigger matches the change by type against the registry
-  → parks an agentic task at `hold` in the FileStore, carrying the board item id
-  → a human flips hold → go in the dashboard        # release to run manually
-  → Dispatcher claims `running` + emits RunAgent (same path as flow 1)
-  → reconciles the run in tasks.json — the shepherd item is NEVER written
-```
-
-The board item is a pure trigger: drover reads it, queues a run off to the side,
-and leaves the person's todo exactly as they set it. Runs park in the held lane
-for the operator to release manually. Run state lives in `tasks.json`, so the
-dashboard shows board-triggered runs alongside sensed ones. Dedup keys on the
-board item id, so one item runs one action at a time and re-fires only after the
-previous run is done.
-
-Sensing is fanned in by `source.Merge`: the GitHub sense (push via
-`gh webhook forward`, or poll) plus `WatchSource` (shepherd's NDJSON stream)
-drive the same loop, both deduped on event id (`--seen` persists across
-restarts). Agent runs go through a bounded worker pool (`--agents N`) so a long
-run never blocks sensing.
+Runs live in `tasks.json`, drover's own store. A source is never written to: a
+board item that triggers a run is left exactly as the person set it. Dedup keys
+on the event's `subject`, so one subject runs one action at a time and re-fires
+only once the previous run is done. Agent runs go through a bounded worker pool
+(`--agents N`) so a long run never blocks ingestion.
 
 ## layout
 
 ```
 drover/
-  cmd/drover/main.go     CLI: watch | action | run | doctor (bare `drover` = dashboard)
-  loop/loop.go           the seams + Loop wiring (interfaces only)
-  store/shepherd.go      CLI adapter — the only file that knows shepherd
-  store/locking.go       serialises concurrent shepherd calls (file-locked)
-  store/fake.go          in-memory Store for tests
-  context/assembler.go   WorkingContext — the attention slice
-  registry/registry.go   the trusted registry of agent actions (RunAgent)
-  policy/router.go       PolicyRouter (prefix match)
-  policy/ingress.go      signal → held agentic task, via the registry
-  policy/dispatch.go     released agentic task → RunAgent (gated hold→go)
-  policy/boardtrigger.go board change → parks a drover run (shepherd untouched)
-  source/github.go       poll merged PRs
-  source/webhook.go      gh webhook forward receiver (push)
-  source/watch.go        WatchSource — NDJSON over `shepherd watch`
-  source/merge.go        fan several sources into one stream
-  source/dedup.go        drop already-handled event ids (mem / file)
-  exec/router.go         RouterExecutor — routes actions to the right executor
-  exec/store.go          StoreExecutor — board mutations, idempotent by link
-  exec/agent.go          AgentExecutor — worker pool, runs `claude`, reconciles
-  exec/runner.go         RunnerExecutor — allowlisted commands, never board-shell
-  tui/daemon.go          RunDaemon — the watch wiring, shared by the CLI + dashboard
-  tui/dashboard.go       dashboard: board picker + in-process watch control + trace
-  tui/action.go          interactive action authoring (huh forms)
-  tui/detail.go          hand-rolled action detail view
-  config/config.toml     the RunAction allowlist (for `drover run`)
+  cmd/drover/main.go              CLI: watch | action | source | doctor (bare = dashboard)
+  cmd/drover/source_github.go     `drover source github` — a plugin, not a built-in
+  cmd/drover/source_shepherd.go   `drover source shepherd` — the ONLY file that knows shepherd
+  daemon/daemon.go                composition root: config → sources → loop
+  loop/loop.go                    the seams + Loop wiring (interfaces only)
+  config/config.go                drover.toml: [[source]], [[runner]], [[action]]
+  context/assembler.go            WorkingContext — the attention slice
+  policy/policy.go                match → park, and re-drive → dispatch
+  source/wire.go                  the event envelope, encode + decode
+  source/exec.go                  ExecSource — spawn a plugin, read NDJSON
+  source/http.go                  HTTPSource — accept POSTed NDJSON
+  source/merge.go                 fan several sources into one stream
+  source/dedup.go                 drop already-handled event ids (mem / file)
+  exec/router.go                  RouterExecutor — routes actions to the right executor
+  exec/store.go                   StoreExecutor — task mutations, one per subject+action
+  exec/agent.go                   AgentExecutor — worker pool, resolves + runs any tool
+  exec/template.go                {{key}} substitution, fail-closed
+  store/file.go                   tasks.json + the re-drive that makes it a Source
+  store/fake.go                   in-memory Store for tests
+  tui/dashboard.go                dashboard: lanes, source filter, watch control, trace
+  tui/action.go                   interactive action authoring
+  tui/form.go                     the picker + editor widgets
+  tui/detail.go                   read-only action detail
 ```
-
-## trusted config
-
-drover keeps two trusted stores, both **outside** the board — so board content
-can never name a command body, only a key:
-
-- **the registry** (`drover action …`, `~/.config/drover/actions.toml`)
-  — agent actions for `RunAgent`. Each row is a stable `id`, an event `on:` to
-  match, an optional `repo:` filter, the `target:` directory, a claude `mode:`,
-  and the prompt `do:`. The board references an action by id only:
-
-  ```toml
-  # normally managed by `drover action add|edit|rm`, not hand-edited
-  [[Actions]]
-  id     = "019f81be59b0…"
-  name   = "fix-ci"
-  on     = "github.pull_request.merged"
-  repo   = "acme/api"          # optional source filter
-  target = "~/src/acme-api"    # the agent's cwd
-  mode   = "acceptEdits"       # claude permission mode
-  do     = "A PR merged. If CI on main is red, open a fix PR."
-  ```
-
-- **the allowlist** (`config/config.toml`) — named commands for `RunAction`,
-  fired by `drover run`. `{{key}}` placeholders substitute from `--arg` as whole
-  argv elements (no shell), with a confirm gate and a provenance record:
-
-  ```toml
-  [actions.rerun-ci]
-  cmd     = ["gh", "workflow", "run", "ci.yml", "--repo", "{{repo}}"]
-  confirm = false
-  timeout = "2m"
-  ```
 
 ## build
 
 ```sh
 go build ./...
-go test ./...                       # hermetic unit tests
-go test -tags integration ./store/  # round-trip against a real shepherd binary
+go test ./...
 ```
 
-Runtime needs `shepherd`, `gh`, and `claude` on `PATH` (the integration test
-needs `shepherd`; watching GitHub needs `gh`; agent runs shell `claude`).
+Runtime needs whatever your sources and runners name — nothing more. The shipped
+shims want `shepherd` and `gh`; the example runner wants `claude`.
+`drover doctor` tells you which are missing.
 
 ## usage
 
 ```sh
-# the dashboard: pick a board, start/stop watch, work the lanes; l = full-window trace
+# the dashboard: work the lanes, filter by source, start/stop the watch
 drover
 
-# prove the boundary: read the board, add a throwaway
-drover doctor --project <board>
+# check the wiring without changing anything
+drover doctor
 
-# author an agent action interactively (guided type→subaction, seeded prompt)
+# author an action interactively
 drover action
 
-# …or scripted: register an action the board can trigger (prompt via $EDITOR)
+# …or scripted (prompt via $EDITOR)
 drover action add --name fix-ci --on github.pull_request.merged \
-  --repo acme/api --target ~/src/acme-api --mode acceptEdits
+  --where repo=acme/api --runner claude --target ~/src/acme-api --mode acceptEdits
 
-# sense and drive the loop — no flags needed; repos are derived from the
-# registry (every github.* action's repo, with its own base/source/interval)
+drover action list
+drover action edit <id> --runner codex
+drover action rm <id>
+
+# sense and drive the loop — no flags needed; drover.toml defines everything
 drover watch
 
-# tail the per-agent-run trace only (stdout), pretty-printed
+# tail the per-run trace only (stdout), pretty-printed
 drover watch 2>/dev/null | jq -c
 
-# overrides: pin a repo, board, parallelism, and tee the trace to a file
-drover watch --repo acme/api --project <board> --agents 2 \
+# persist the dedup set and tee the trace
+drover watch --agents 2 \
   --seen ~/.local/state/drover/seen --provenance ~/.local/state/drover/prov.jsonl
 
-# fire an allowlisted named command directly
-drover run fix-ci --arg repo=acme/api --arg task="fix the failing run" --yes
+# run a source plugin by hand, to see what it emits
+drover source github --repo acme/api --mode poll
+drover source shepherd --all
 ```
 
-Bare `drover` (on a terminal) opens the **dashboard**: the held/running/done
-lanes, a board picker (`b`) that defaults to **all boards** — one `shepherd
-watch` per board, fanned into one stream, the lanes grouped by a board
-sub-header — or narrowed to a single board, `s` to start/stop the watch daemon
-**in-process** with a ● running / ○ stopped indicator, `l` for the full-window
-daemon trace, and `a` to jump into the action manager and back — the daemon
-keeps running across that hop. Piped/CI, `drover` prints usage instead.
+Two output streams keep machine trace and human log apart:
 
-`drover action` opens the action manager — pick a type (github/sentry/board) and
-subaction, and the prompt field is seeded with a sensible default you edit; it
-also lists, views, edits and deletes existing actions. `drover action
-list|edit|rm` are the scriptable equivalents; edits take effect on the next event
-without restarting `watch` (the registry reloads per event).
-
-`drover watch` needs no flags: it senses every repo named by a `github.*` action
-(each carrying its own `base`/`source`/`interval`) plus the board, so the
-registry alone defines what runs. `--repo` overrides with an explicit target.
-
-Two output streams while watching keep machine trace and human log apart:
-
-- **stdout** — the structured trace: one JSON record per agent run
-  (`at`, `action`, `task`, `target`, `status`, `summary`, `outcome`). Always on;
-  pipe it to `jq`, or tee it to a file with `--provenance`.
-- **stderr** — the operational log: sensing, seeding, parking, errors.
+- **stdout** — the structured trace: one JSON record per agent run (`at`,
+  `action`, `agent`, `task`, `target`, `status`, `summary`, `outcome`).
+- **stderr** — the operational log: ingestion, parking, errors.
 
 ## design principles
 
-- **Never exec strings from the board.** The synced, hand-editable file is
-  untrusted input. The executor takes action *names/ids* resolved against
-  trusted config — never command bodies from item fields.
-- **Address items by id, never index.** Indices shift as the board reorders;
-  ids never do.
-- **Policy is a pure function of context.** No I/O in `Decide` — table-testable,
-  and a new policy drops in behind the same interface.
+- **Never exec a string from an event.** Event content is untrusted input. The
+  executor takes action *ids* resolved against trusted config — never a command
+  body from an event field.
+- **A source is a process, not a type.** If adding one needs a Go change, the
+  seam is in the wrong place.
+- **Address by id, never index.** Indices shift; ids never do.
+- **Policy is a pure function of context.** No I/O in `Decide` — table-testable.
 - **Gate before acting.** An agent runs on event-derived text only after a human
-  flips the task `hold → go`; the executor validates every action against a
-  fixed vocabulary first.
+  releases it, unless an action explicitly opts out.
 
-## non-goals (v1)
+## non-goals
 
-- no perception — "sensing" means structured events (GitHub / Sentry / webhooks
-  / board watch).
-- no ML inside drover — the intelligence lives in the agent it invokes; drover
-  keeps clean, queryable history via shepherd.
-- no reimplementation of shepherd's storage — drover never owns the file.
+- no perception — "sensing" means structured events.
+- no ML inside drover — the intelligence lives in the tool it invokes; drover
+  keeps clean, queryable history.
+- no storage drover doesn't own — a source is read, never written.
