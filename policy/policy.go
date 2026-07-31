@@ -67,6 +67,7 @@ func (p Policy) park(c loop.Context) []loop.Action {
 		acts = append(acts, loop.AddTask{Spec: loop.Spec{
 			Text:    taskText(c.Event),
 			Status:  s,
+			Type:    c.Event.Type,     // the raising event's type, carried for diagnostics
 			Action:  a.ID,             // reference only; the prompt lives in the config
 			Subject: subject(c.Event), // one run per (subject, action) at a time
 			Source:  c.Event.Source,

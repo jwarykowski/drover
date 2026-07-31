@@ -48,6 +48,9 @@ func TestParksOneHeldRunPerMatchingAction(t *testing.T) {
 	if s.Subject != "u" {
 		t.Errorf("subject not carried: %q", s.Subject)
 	}
+	if s.Type != "github.pull_request.merged" {
+		t.Errorf("event type not carried: %q", s.Type)
+	}
 	if s.Data["repo"] != "acme/api" {
 		t.Errorf("event data must ride along for the prompt: %v", s.Data)
 	}
