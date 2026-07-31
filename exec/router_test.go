@@ -43,7 +43,7 @@ func TestRouterDispatchesByTypeInOrder(t *testing.T) {
 
 func TestStoreExecutorAppliesSetStatus(t *testing.T) {
 	st := &store.FakeStore{}
-	st.Seed(loop.Item{ID: "t1", Status: "go"})
+	st.Seed(loop.Task{ID: "t1", Status: "go"})
 	x := StoreExecutor{Store: st}
 	if err := x.Apply(context.Background(), []loop.Action{loop.SetStatus{ID: "t1", Status: "done"}}); err != nil {
 		t.Fatal(err)

@@ -1,5 +1,5 @@
 // Package exec applies actions. StoreExecutor handles task mutations; it never
-// runs strings sourced from the board.
+// runs a string sourced from an event.
 package exec
 
 import (
@@ -9,21 +9,21 @@ import (
 	"github.com/jwarykowski/drover/loop"
 )
 
-// StoreExecutor applies board mutations (AddTask, SetStatus) through a Store. It
-// never runs strings sourced from the board.
+// StoreExecutor applies task mutations (AddTask, SetStatus) through a Store. It
+// never runs a string sourced from an event.
 type StoreExecutor struct {
 	Store loop.Store
 }
 
-// Apply handles each board action: AddTask creates a task (skipping any whose
-// link AND action already exist — dedup by link+action so one event can still
-// raise several distinct actions, while a re-delivery of the same event doesn't
-// double-park); SetStatus transitions an existing item by id.
+// Apply handles each action: AddTask creates a task (skipping any whose subject
+// AND action already have a live run — so one event can still raise several
+// distinct actions, while a repeat event about the same subject doesn't
+// double-park); SetStatus transitions an existing task by id.
 func (x StoreExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 	for _, a := range actions {
 		switch v := a.(type) {
 		case loop.AddTask:
-			exists, err := x.taskExists(ctx, v.Spec.Link, v.Spec.Action)
+			exists, err := x.taskExists(ctx, v.Spec.Subject, v.Spec.Action)
 			if err != nil {
 				return err
 			}
@@ -44,24 +44,24 @@ func (x StoreExecutor) Apply(ctx context.Context, actions []loop.Action) error {
 	return nil
 }
 
-// taskExists reports whether an ACTIVE (not-done) item already carries this link
-// and action — so a re-delivered event doesn't double-park while a run is in
-// flight, a different action on the same link still gets its own task, and a
-// completed run no longer blocks a fresh one (re-fire after done). An empty link
-// never dedups (nothing to key on).
-func (x StoreExecutor) taskExists(ctx context.Context, link, action string) (bool, error) {
-	if link == "" {
+// taskExists reports whether an ACTIVE (not-done) task already carries this
+// subject and action — so a repeat event doesn't double-park while a run is in
+// flight, a different action on the same subject still gets its own task, and a
+// completed run no longer blocks a fresh one (re-fire after done). An empty
+// subject never dedups (nothing to key on).
+func (x StoreExecutor) taskExists(ctx context.Context, subject, action string) (bool, error) {
+	if subject == "" {
 		return false, nil
 	}
-	board, err := x.Store.List(ctx, loop.Filter{IncludeDone: true})
+	tasks, err := x.Store.List(ctx, loop.Filter{IncludeDone: true})
 	if err != nil {
 		return false, err
 	}
-	for _, it := range board {
-		if it.Done {
+	for _, t := range tasks {
+		if t.Done {
 			continue // a finished run no longer blocks a fresh trigger
 		}
-		if it.Link == link && it.Action == action {
+		if t.Subject == subject && t.Action == action {
 			return true, nil
 		}
 	}
