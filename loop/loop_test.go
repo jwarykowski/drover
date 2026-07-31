@@ -20,10 +20,10 @@ func (r *recorder) Apply(_ context.Context, a []Action) error {
 }
 
 // passAssembler wraps an event into a bare Context.
-type passAssembler struct{ board []Item }
+type passAssembler struct{ tasks []Task }
 
 func (p passAssembler) Assemble(_ context.Context, e Event) (Context, error) {
-	return Context{Event: e, Board: p.board}, nil
+	return Context{Event: e, Tasks: p.tasks}, nil
 }
 
 func TestLoopRun(t *testing.T) {

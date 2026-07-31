@@ -5,9 +5,40 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/jwarykowski/drover/loop"
 )
+
+// Timestamps: Add stamps Created, marking a task done stamps Completed, and
+// reopening clears it. corral surfaces these on the card.
+func TestFileStoreStampsTimestamps(t *testing.T) {
+	ctx := context.Background()
+	fixed := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	old := Now
+	Now = func() time.Time { return time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC) }
+	defer func() { Now = old }()
+
+	s, _ := OpenFileStore("")
+	it, _ := s.Add(ctx, loop.Spec{Text: "t"})
+	if it.Created != fixed {
+		t.Fatalf("Created not stamped: %q", it.Created)
+	}
+	if err := s.SetStatus(ctx, it.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.List(ctx, loop.Filter{IncludeDone: true})
+	if got[0].Completed != fixed {
+		t.Fatalf("Completed not stamped on done: %q", got[0].Completed)
+	}
+	if err := s.SetStatus(ctx, it.ID, "undone"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.List(ctx, loop.Filter{})
+	if got[0].Completed != "" {
+		t.Fatalf("Completed not cleared on reopen: %q", got[0].Completed)
+	}
+}
 
 // The money path: state must survive a process restart (a parked hold must still
 // be there, and a release must persist), since durability is the whole reason the
@@ -20,7 +51,7 @@ func TestFileStorePersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	it, err := s.Add(ctx, loop.Spec{Text: "fix ci", Agentic: true, Action: "a1", Status: "hold"})
+	it, err := s.Add(ctx, loop.Spec{Text: "fix ci", Action: "a1", Status: "hold"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +71,7 @@ func TestFileStorePersistsAcrossReopen(t *testing.T) {
 	if len(got) != 1 || got[0].ID != it.ID {
 		t.Fatalf("task not persisted: %+v", got)
 	}
-	if got[0].Status != "go" || !got[0].Agentic || got[0].Action != "a1" {
+	if got[0].Status != "go" || got[0].Action != "a1" {
 		t.Fatalf("fields not persisted: %+v", got[0])
 	}
 }
@@ -48,7 +79,7 @@ func TestFileStorePersistsAcrossReopen(t *testing.T) {
 func TestFileStoreDoneAndArchive(t *testing.T) {
 	ctx := context.Background()
 	s, _ := OpenFileStore("") // in-memory
-	it, _ := s.Add(ctx, loop.Spec{Text: "t", Agentic: true})
+	it, _ := s.Add(ctx, loop.Spec{Text: "t"})
 
 	if err := s.SetStatus(ctx, it.ID, "done"); err != nil {
 		t.Fatal(err)
@@ -94,7 +125,7 @@ func TestFileStoreDelete(t *testing.T) {
 func TestFileStoreRestart(t *testing.T) {
 	ctx := context.Background()
 	s, _ := OpenFileStore("")
-	it, _ := s.Add(ctx, loop.Spec{Text: "run", Agentic: true, Action: "a1", Status: "go"})
+	it, _ := s.Add(ctx, loop.Spec{Text: "run", Action: "a1", Status: "go"})
 	_ = s.Note(ctx, it.ID, "done: shipped")
 	_ = s.SetStatus(ctx, it.ID, "done")
 	_ = s.Archive(ctx, it.ID)

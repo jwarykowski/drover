@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,11 +16,10 @@ import (
 	"github.com/jwarykowski/drover/loop"
 )
 
-// FileStore is drover's own task datastore: agentic tasks live here as JSON, not
-// on a shepherd board. It is BOTH a loop.Store (the task CRUD seam the loop
-// mutates) and a loop.Source (a ticker re-drives live tasks as board.updated
-// events so a released hold→go task gets dispatched — the same nudge shepherd's
-// poll-mode watch gives, but in-process).
+// FileStore is drover's task datastore: runs live here as JSON, owned by
+// drover alone. It is BOTH a loop.Store (the CRUD seam the loop mutates) and a
+// loop.Source (a ticker re-drives live tasks as task.updated events, so a task
+// a human has released gets dispatched without any source having to notice).
 //
 // A single instance is shared by the daemon and the dashboard, so its mutex is
 // the one serialisation point; two instances over one file would clobber each
@@ -30,18 +30,24 @@ type FileStore struct {
 	tick time.Duration
 
 	mu    sync.Mutex
-	items []loop.Item // live board
-	arch  []loop.Item // archived, off the live board
+	items []loop.Task // live tasks
+	arch  []loop.Task // archived, off the live lanes
 	seq   int         // monotonic Index source
 }
 
-// fileData is the on-disk shape: the whole store rewritten atomically per change
-// (tiny at task scale — mirrors registry.go).
+// fileData is the on-disk shape: the whole store rewritten atomically per
+// change (tiny at task scale).
 type fileData struct {
-	Items    []loop.Item `json:"items"`
-	Archived []loop.Item `json:"archived"`
+	Items    []loop.Task `json:"items"`
+	Archived []loop.Task `json:"archived"`
 	Seq      int         `json:"seq"`
 }
+
+// Now is the clock used to stamp task timestamps, swappable in tests.
+var Now = time.Now
+
+// ErrNotFound is returned when a task id addresses nothing.
+var ErrNotFound = errors.New("task not found")
 
 // OpenFileStore loads the task store from path. A missing file is an empty store
 // (first run), not an error. An empty path is an in-memory store (tests).
@@ -84,30 +90,24 @@ func (s *FileStore) flush() error {
 	return os.Rename(tmp, s.path) // atomic: a crash never leaves a half-written file
 }
 
-// Archived returns a copy of the archived (completed, off-board) tasks, newest
-// last. The dashboard surfaces these in the done lane so a finished run stays
+// Archived returns a copy of the archived (completed) tasks, newest last. The
+// dashboard surfaces these in the done lane so a finished run stays
 // reviewable (its per-job log is keyed by id and persists regardless).
-func (s *FileStore) Archived() []loop.Item {
+func (s *FileStore) Archived() []loop.Task {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]loop.Item, len(s.arch))
+	out := make([]loop.Task, len(s.arch))
 	copy(out, s.arch)
 	return out
 }
 
-// List returns the live board narrowed by f (Done/Category/Text), a copy.
-func (s *FileStore) List(_ context.Context, f loop.Filter) ([]loop.Item, error) {
+// List returns the live tasks, a copy; f only decides whether done ones ride along.
+func (s *FileStore) List(_ context.Context, f loop.Filter) ([]loop.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []loop.Item
+	var out []loop.Task
 	for _, it := range s.items {
 		if it.Done && !f.IncludeDone {
-			continue
-		}
-		if f.Category != "" && it.Category != f.Category {
-			continue
-		}
-		if f.Text != "" && !strings.Contains(it.Text, f.Text) {
 			continue
 		}
 		out = append(out, it)
@@ -116,34 +116,35 @@ func (s *FileStore) List(_ context.Context, f loop.Filter) ([]loop.Item, error) 
 }
 
 // Add appends a new task from spec and returns it.
-func (s *FileStore) Add(_ context.Context, spec loop.Spec) (loop.Item, error) {
+func (s *FileStore) Add(_ context.Context, spec loop.Spec) (loop.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seq++
-	it := loop.Item{
+	it := loop.Task{
 		ID:       newTaskID(),
 		Index:    s.seq,
 		Text:     spec.Text,
-		Category: spec.Category,
 		Priority: strings.ToUpper(spec.Priority),
 		Status:   spec.Status,
-		Agentic:  spec.Agentic,
 		Action:   spec.Action,
+		Subject:  spec.Subject,
 		Due:      spec.Due,
 		Link:     spec.Link,
 		Note:     spec.Note,
-		Board:    spec.Board,
+		Source:   spec.Source,
+		Data:     spec.Data,
+		Created:  Now().UTC().Format(time.RFC3339),
 	}
 	s.items = append(s.items, it)
 	if err := s.flush(); err != nil {
-		return loop.Item{}, err
+		return loop.Task{}, err
 	}
 	return it, nil
 }
 
-// SetStatus marks an item done/undone or sets a named status, by id. Mirrors
-// ShepherdStore: "done" closes it; "undone"/"" reopens and clears status; any
-// other value is a named status (e.g. hold/go/running) on an open item.
+// SetStatus marks a task done/undone or sets a named status, by id. "done"
+// closes it; "undone"/"" reopens and clears status; any other value is a named
+// status (e.g. hold/go/running) on an open task.
 func (s *FileStore) SetStatus(_ context.Context, id, status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -154,15 +155,16 @@ func (s *FileStore) SetStatus(_ context.Context, id, status string) error {
 	switch status {
 	case "done":
 		it.Done = true
+		it.Completed = Now().UTC().Format(time.RFC3339)
 	case "undone", "":
-		it.Done, it.Status = false, ""
+		it.Done, it.Status, it.Completed = false, "", ""
 	default:
 		it.Done, it.Status = false, status
 	}
 	return s.flush()
 }
 
-// Note attaches a note to an item by id.
+// Note attaches a note to a task by id.
 func (s *FileStore) Note(_ context.Context, id, text string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -174,7 +176,7 @@ func (s *FileStore) Note(_ context.Context, id, text string) error {
 	return s.flush()
 }
 
-// Archive moves an item off the live board into the archive.
+// Archive moves a task off the live lanes into the archive.
 func (s *FileStore) Archive(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -189,7 +191,7 @@ func (s *FileStore) Archive(_ context.Context, id string) error {
 	return fmt.Errorf("%w: %s", ErrNotFound, id)
 }
 
-// Delete removes a task entirely, from the live board or the archive — used by
+// Delete removes a task entirely, live or archived — used by
 // the dashboard to drop a run the operator no longer wants. The per-job log is
 // the caller's to remove (the store doesn't know the log dir).
 func (s *FileStore) Delete(_ context.Context, id string) error {
@@ -210,7 +212,7 @@ func (s *FileStore) Delete(_ context.Context, id string) error {
 	return fmt.Errorf("%w: %s", ErrNotFound, id)
 }
 
-// Restart re-queues a run: pulled back onto the live board if it was archived,
+// Restart re-queues a run: pulled back onto the live lanes if it was archived,
 // then reset to a fresh parked task (hold, not done, verdict cleared) so it
 // waits in the held lane for the operator to release — same gate as any run.
 // The stale per-job log is the caller's to clear.
@@ -232,8 +234,8 @@ func (s *FileStore) Restart(_ context.Context, id string) error {
 	return fmt.Errorf("%w: %s", ErrNotFound, id)
 }
 
-// find returns a pointer to the live item with id, or nil. Caller holds s.mu.
-func (s *FileStore) find(id string) *loop.Item {
+// find returns a pointer to the live task with id, or nil. Caller holds s.mu.
+func (s *FileStore) find(id string) *loop.Task {
 	for i := range s.items {
 		if s.items[i].ID == id {
 			return &s.items[i]
@@ -243,12 +245,12 @@ func (s *FileStore) find(id string) *loop.Item {
 }
 
 // Events makes FileStore a loop.Source: every tick it re-drives each open task
-// as a board.updated event. The Dispatcher reads the task's LIVE status (not the
-// event's), so replaying an already-claimed task is a no-op — only a task at `go`
-// fires. Latency to dispatch is at most one tick.
+// as a task.updated event. The policy reads the task's LIVE status (not the
+// event's), so replaying an already-claimed task is a no-op — only a task at
+// `go` fires. Latency to dispatch is at most one tick.
 //
-// ponytail: fixed-interval re-drive of the whole open board; add a mutation
-// notify channel only if that latency ever bites.
+// Fixed-interval re-drive of every open task; add a mutation notify channel
+// only if that latency ever bites.
 func (s *FileStore) Events(ctx context.Context) <-chan loop.Event {
 	out := make(chan loop.Event) // unbuffered: the loop paces the re-drive
 	go func() {
@@ -274,10 +276,10 @@ func (s *FileStore) Events(ctx context.Context) <-chan loop.Event {
 }
 
 // liveSnapshot copies the open (not-done) tasks under the lock.
-func (s *FileStore) liveSnapshot() []loop.Item {
+func (s *FileStore) liveSnapshot() []loop.Task {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]loop.Item, 0, len(s.items))
+	out := make([]loop.Task, 0, len(s.items))
 	for _, it := range s.items {
 		if !it.Done {
 			out = append(out, it)
@@ -286,12 +288,15 @@ func (s *FileStore) liveSnapshot() []loop.Item {
 	return out
 }
 
-func taskEvent(it loop.Item) loop.Event {
+// taskEvent is the one event drover raises rather than ingests. It carries only
+// the task id: the policy resolves the task's live state from the store, so a
+// stale replay can never fire on a status the task has already left.
+func taskEvent(t loop.Task) loop.Event {
 	return loop.Event{
-		ID:     "task:updated:" + it.ID,
-		Type:   "board.updated",
+		ID:     "task:updated:" + t.ID,
+		Type:   loop.TaskUpdated,
 		Source: "drover.tasks",
-		Data:   loop.BoardChange{Item: it},
+		Data:   map[string]string{"task_id": t.ID},
 		At:     time.Now(),
 	}
 }
@@ -302,7 +307,7 @@ func newTaskID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// DefaultTasksPath is where the agentic task store lives, beside actions.toml.
+// DefaultTasksPath is where the task store lives, beside drover.toml.
 func DefaultTasksPath() string {
 	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
 		return filepath.Join(xdg, "drover", "tasks.json")
@@ -311,7 +316,7 @@ func DefaultTasksPath() string {
 	return filepath.Join(home, ".config", "drover", "tasks.json")
 }
 
-// DefaultLogDir is where per-job claude stream logs live, beside tasks.json.
+// DefaultLogDir is where per-job agent stream logs live, beside tasks.json.
 func DefaultLogDir() string {
 	return filepath.Join(filepath.Dir(DefaultTasksPath()), "logs")
 }
