@@ -8,37 +8,40 @@ import (
 	"github.com/jwarykowski/drover/store"
 )
 
-func TestWorkingContextAttendsToCategory(t *testing.T) {
+func TestWorkingContextCarriesEventAndTasks(t *testing.T) {
 	fs := &store.FakeStore{}
 	fs.Seed(
-		loop.Item{Text: "old ci break", Category: "ci"},
-		loop.Item{Text: "buy milk", Category: "home"},
+		loop.Task{ID: "t1", Text: "old ci break"},
+		loop.Task{ID: "t2", Text: "buy milk"},
 	)
 	w := WorkingContext{Store: fs}
 
-	c, err := w.Assemble(context.Background(), loop.Event{Kind: "ci.failed"})
+	c, err := w.Assemble(context.Background(), loop.Event{Type: "github.pull_request.merged"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Event.Kind != "ci.failed" {
+	if c.Event.Type != "github.pull_request.merged" {
 		t.Errorf("event not carried through: %+v", c.Event)
 	}
-	// ci.failed attends to the ci slice only.
-	if len(c.Board) != 1 || c.Board[0].Category != "ci" {
-		t.Errorf("want 1 ci item, got %+v", c.Board)
+	// Nothing narrows yet: dispatch resolves a task by id, so it needs every open
+	// task in the slice. A filter that hid the dispatched task would stop it firing.
+	if len(c.Tasks) != 2 {
+		t.Errorf("want every open task, got %d: %+v", len(c.Tasks), c.Tasks)
 	}
 }
 
-func TestWorkingContextUnknownKindSeesWholeBoard(t *testing.T) {
+// A done task is not in the assembled slice, so a re-drive for one cannot
+// dispatch — the store's own filter is what makes replay safe.
+func TestWorkingContextExcludesDoneTasks(t *testing.T) {
 	fs := &store.FakeStore{}
-	fs.Seed(loop.Item{Text: "a", Category: "ci"}, loop.Item{Text: "b", Category: "home"})
+	fs.Seed(loop.Task{ID: "t1", Text: "a"}, loop.Task{ID: "t2", Text: "b", Done: true})
 	w := WorkingContext{Store: fs}
 
-	c, err := w.Assemble(context.Background(), loop.Event{Kind: "note.added"})
+	c, err := w.Assemble(context.Background(), loop.Event{Type: loop.TaskUpdated})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Board) != 2 {
-		t.Errorf("unknown kind: want whole board (2), got %d", len(c.Board))
+	if len(c.Tasks) != 1 || c.Tasks[0].ID != "t1" {
+		t.Errorf("done task should not be attended to: %+v", c.Tasks)
 	}
 }
