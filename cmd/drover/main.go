@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/x/term"
 	"github.com/jwarykowski/drover/config"
@@ -147,6 +148,8 @@ func sourceCmd(ctx context.Context, argv []string) error {
 	}
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	ctx, orphaned := watchParent(ctx, os.Getppid, 2*time.Second)
+	defer orphaned()
 	switch argv[0] {
 	case "github":
 		return sourceGitHub(ctx, argv[1:])
@@ -157,6 +160,48 @@ func sourceCmd(ctx context.Context, argv []string) error {
 	default:
 		return fmt.Errorf("source: unknown plugin %q (want github, shepherd or webhook)", argv[0])
 	}
+}
+
+// watchParent cancels ctx once this process has been orphaned, so a shim outlives
+// whatever spawned it by at most one tick.
+//
+// ExecSource group-SIGTERMs a plugin on shutdown (source/exec.go), but that only
+// runs if the spawner lives long enough to run it. A SIGKILLed, crashed or
+// force-quit parent runs nothing, and every shim it started is reparented to init
+// still holding its port and its own children — after which the next launch cannot
+// bind. PR_SET_PDEATHSIG is Linux-only, so the portable signal is the child
+// noticing it has been reparented.
+//
+// Cancelling rather than exiting is the point: each shim already shuts down
+// cleanly on ctx — webhook closes its listener, shepherd reaps its `shepherd
+// watch` children — which is the same path SIGTERM takes.
+//
+// ponytail: a poll, not an inherited pipe whose EOF says the same thing exactly.
+// A pipe needs cooperation from every spawner, and two seconds of a doomed shim
+// costs nothing.
+func watchParent(ctx context.Context, getppid func() int, every time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	// Started by init directly (a launchd job), so there is no parent to outlive
+	// and no reparenting left to detect.
+	if start := getppid(); start != 1 {
+		go func() {
+			t := time.NewTicker(every)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if getppid() != start {
+						fmt.Fprintln(os.Stderr, "parent gone; shutting down")
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+	return ctx, cancel
 }
 
 // actionCmd is the CRUD UI over the actions in drover.toml. This is the only
