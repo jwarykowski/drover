@@ -20,13 +20,13 @@ func cfg(sources ...config.Source) *config.Config {
 func TestBuildChoosesTransportPerRow(t *testing.T) {
 	cf := cfg(
 		config.Source{Name: "shepherd", Cmd: []string{"drover", "source", "shepherd"}},
-		config.Source{Name: "sentry", HTTP: "127.0.0.1:9100"},
+		config.Source{Name: "remote", HTTP: "127.0.0.1:9100"},
 	)
 	srcs, names := build(cf, source.NewMemSeen(), func(string, ...any) {})
 	if len(srcs) != 2 {
 		t.Fatalf("want 2 sources, got %d", len(srcs))
 	}
-	if names[0] != "shepherd" || names[1] != "sentry" {
+	if names[0] != "shepherd" || names[1] != "remote" {
 		t.Fatalf("names = %v", names)
 	}
 	// Every configured source is deduped by event id; only the task re-drive is

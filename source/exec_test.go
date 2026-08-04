@@ -117,6 +117,18 @@ func TestExecSourceReadsAPluginProcess(t *testing.T) {
 	}
 }
 
+// A shim that dies at once — a binary too old for the subcommand, a port already
+// bound, a missing jq — is the common misconfiguration, and its exit status is
+// the only clue the restart log carries. Discarding it made that log read as
+// "ended (<nil>)", once a second, forever.
+func TestStreamReportsHowTheShimExited(t *testing.T) {
+	out := make(chan loop.Event, 1)
+	src := ExecSource{Name: "broken", Cmd: []string{"sh", "-c", "echo unknown plugin >&2; exit 3"}}
+	if err := src.stream(context.Background(), out); err == nil || !strings.Contains(err.Error(), "exit status 3") {
+		t.Fatalf("want the exit status, got %v", err)
+	}
+}
+
 // A source row with no command must not spin: it logs once and stops.
 func TestExecSourceWithoutCmdClosesCleanly(t *testing.T) {
 	var logs []string

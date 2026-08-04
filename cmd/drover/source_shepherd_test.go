@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -112,4 +115,54 @@ func TestBoardIDNamesTheDefaultBoard(t *testing.T) {
 	if got := boardID("work"); got != "work" {
 		t.Fatalf("named board = %q", got)
 	}
+}
+
+// A board created after the shim started must still be watched: the board list
+// is re-read, not frozen at startup. Regression — --all used to snapshot the
+// list once, so todos on a newer board raised no events until a restart.
+func TestWatchAllPicksUpBoardsCreatedLater(t *testing.T) {
+	dir := t.TempDir()
+	list := filepath.Join(dir, "boards.json")
+	spawned := filepath.Join(dir, "spawned.txt")
+	write(t, list, `[{"name":"one"}]`)
+
+	bin := filepath.Join(dir, "shepherd")
+	write(t, bin, "#!/bin/sh\n"+
+		"if [ \"$1\" = boards ]; then cat "+list+"; exit 0; fi\n"+
+		"echo \"$@\" >> "+spawned+"\n"+
+		"while :; do sleep 1; done\n")
+	if err := os.Chmod(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watchAll(ctx, &lineWriter{w: io.Discard}, bin, 0, time.Millisecond, 20*time.Millisecond)
+	}()
+	defer func() { cancel(); <-done }()
+
+	waitForLine(t, spawned, "watch --board one")
+	write(t, list, `[{"name":"one"},{"name":"two"}]`)
+	waitForLine(t, spawned, "watch --board two")
+}
+
+func write(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForLine(t *testing.T, path, want string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(path)
+	t.Fatalf("never spawned %q; got:\n%s", want, b)
 }

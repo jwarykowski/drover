@@ -199,16 +199,16 @@ func (x *AgentExecutor) Apply(ctx context.Context, actions []loop.Action) error 
 func (x *AgentExecutor) handle(ctx context.Context, ra loop.RunAgent) error {
 	act, ok := x.Config.ByID(ra.ActionID)
 	if !ok {
-		// The action was removed (or renamed) between parking and release.
-		// That's a data condition, not a fault: reconcile a note so the human
-		// sees why the released task never ran, rather than logging and
-		// abandoning it claimed with nothing to show.
-		return x.fail(ctx, ra, fmt.Sprintf("action %q no longer configured", ra.ActionID), "error: action not configured")
+		// The action was removed (or renamed) between parking and release. No
+		// re-release can fix that — there is nothing left to run — so close the
+		// task out with the reason instead of leaving it claimed at running,
+		// where it reads like work in flight and invites another release.
+		return x.fail(ctx, ra, "done", fmt.Sprintf("action %q no longer configured", ra.ActionID), "error: action not configured")
 	}
 
 	runner, err := x.Config.RunnerByName(act.Runner)
 	if err != nil {
-		return x.fail(ctx, ra, err.Error(), "error: "+err.Error())
+		return x.fail(ctx, ra, "blocked", err.Error(), "error: "+err.Error())
 	}
 
 	// The runner owns its permission mode: an action runs at the runner's first
@@ -222,11 +222,11 @@ func (x *AgentExecutor) handle(ctx context.Context, ra loop.RunAgent) error {
 	argv, err := renderArgv(runner.Cmd, map[string]string{"prompt": prompt, "mode": mode})
 	if err != nil {
 		msg := fmt.Sprintf("runner %q command template: %v", runner.Name, err)
-		return x.fail(ctx, ra, msg, "error: "+msg)
+		return x.fail(ctx, ra, "blocked", msg, "error: "+msg)
 	}
 	if len(argv) == 0 {
 		msg := fmt.Sprintf("runner %q has an empty cmd", runner.Name)
-		return x.fail(ctx, ra, msg, "error: "+msg)
+		return x.fail(ctx, ra, "blocked", msg, "error: "+msg)
 	}
 
 	// Tee the run into a per-job log file so the dashboard can show what the
@@ -268,10 +268,12 @@ func (x *AgentExecutor) handle(ctx context.Context, ra loop.RunAgent) error {
 	return nil
 }
 
-// fail records a run that never started as a blocked verdict, so the task
-// carries the reason instead of sitting claimed and silent.
-func (x *AgentExecutor) fail(ctx context.Context, ra loop.RunAgent, summary, outcome string) error {
-	v := verdict{Status: "blocked", Summary: summary}
+// fail records a run that never started, so the task carries the reason instead
+// of sitting claimed and silent. status is the verdict it lands on: "blocked"
+// leaves it running for inspection (the wiring can be fixed and the run
+// re-released), "done" closes it out when nothing could ever run it.
+func (x *AgentExecutor) fail(ctx context.Context, ra loop.RunAgent, status, summary, outcome string) error {
+	v := verdict{Status: status, Summary: summary}
 	recErr := x.reconcile(ctx, ra.TaskID, v)
 	x.write(agentRecord{
 		At: now(), Action: ra.ActionID, Task: ra.TaskID,

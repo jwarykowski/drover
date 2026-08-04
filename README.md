@@ -159,6 +159,33 @@ downstream, an action cannot tell which transport raised an event.
 spawned through the same path, with no privileged route in. That is the proof
 the contract is real.
 
+### not writing a source
+
+Most third parties already emit JSON, just not *this* JSON. `drover source
+webhook` binds a port, accepts whatever they POST, and maps it to the envelope
+with a jq program from config — so a new SaaS feed is a config row and no
+plugin at all:
+
+```toml
+[[source]]
+name  = "sentry"
+cmd   = ["drover", "source", "webhook", "--addr", "127.0.0.1:9100", "--map",
+         '{id: "sentry:\(.data.issue.id):\(.action)", type: "sentry.issue.\(.action)", data: {title: .data.issue.title, subject: .data.issue.id, url: .data.issue.web_url}}']
+types = ["sentry.issue.created"]
+```
+
+The mapping owns the two rules above: fold something changing into `id` (or
+Dedup swallows every repeat forever) and put the stable thing in `subject`. A
+program emitting several objects turns one batched delivery into several events.
+Worked configs for Sentry, Datadog and Alertmanager: `docs/examples/webhook.toml`.
+
+Same posture as `http =`: localhost, no auth, anything that reaches the port can
+raise an event. Authenticate at a proxy before taking public deliveries.
+
+Scheduled events need no source code either — `docs/examples/timer.sh` is a
+`printf` in a `sleep` loop, and cron or launchd POSTing to a `webhook` address
+covers it better if missed ticks matter.
+
 ## runners
 
 A runner is an argv template. `{{prompt}}` receives the built prompt and
@@ -212,8 +239,11 @@ cmd   = ["drover", "source", "github", "--repo", "acme/api"]
 types = ["github.pull_request.merged", "github.issues.opened"]
 
 [[source]]
-name = "sentry"
-http = "127.0.0.1:9100"
+name  = "sentry"
+cmd   = ["drover", "source", "webhook", "--addr", "127.0.0.1:9100", "--map",
+         '{id: "sentry:\(.data.issue.id):\(.action)", type: "sentry.issue.\(.action)", data: {title: .data.issue.title, subject: .data.issue.id, url: .data.issue.web_url}}']
+types = ["sentry.issue.created", "sentry.issue.resolved"]
+# or `http = "127.0.0.1:9100"` and no cmd, if the sender already speaks the envelope
 
 [[runner]]
 name  = "claude"

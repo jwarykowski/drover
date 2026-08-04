@@ -43,33 +43,67 @@ func sourceShepherd(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// One `shepherd boards` read serves both the board list and each board's
-	// working directory, which rides along in every event as {{dir}}.
-	dirs, err := shepherdBoards(ctx, *bin)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "list boards: %v; continuing without board dirs\n", err)
-		dirs = map[string]string{}
-	}
-	boards := []string{*board}
-	if *all && len(dirs) > 0 {
-		boards = boards[:0]
-		for name := range dirs {
-			boards = append(boards, name)
-		}
-		sort.Strings(boards)
-	}
-
 	out := &lineWriter{w: os.Stdout}
+	if !*all {
+		// One `shepherd boards` read serves the board's working directory, which
+		// rides along in every event as {{dir}}.
+		dirs, err := shepherdBoards(ctx, *bin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "list boards: %v; continuing without board dirs\n", err)
+			dirs = map[string]string{}
+		}
+		watchBoard(ctx, out, *bin, *board, dirs[*board], *interval, *backoff)
+		return nil
+	}
+	watchAll(ctx, out, *bin, *interval, *backoff, boardRescan)
+	return nil
+}
+
+// boardRescan is how often --all re-reads `shepherd boards`. The list is not a
+// startup constant: a board created after the shim started would otherwise
+// never be watched, and its todos would silently raise no events.
+const boardRescan = 30 * time.Second
+
+// watchAll watches every board, re-reading the board list on each tick so boards
+// created later get picked up. A watcher, once started, runs for the life of the
+// shim.
+// ponytail: a deleted board leaves its watcher polling a missing file (harmless,
+// it just never fires); stop them per board if that ever costs anything.
+func watchAll(ctx context.Context, out *lineWriter, bin string, interval, backoff, rescan time.Duration) {
 	var wg sync.WaitGroup
-	for _, b := range boards {
-		wg.Add(1)
-		go func(b string) {
-			defer wg.Done()
-			watchBoard(ctx, out, *bin, b, dirs[b], *interval, *backoff)
-		}(b)
+	watching := map[string]bool{}
+	for ctx.Err() == nil {
+		dirs, err := shepherdBoards(ctx, bin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "list boards: %v\n", err)
+			// Nothing watched yet means a cold start with shepherd unreachable —
+			// fall back to the default board so the source is not silently dead.
+			if len(watching) == 0 {
+				dirs = map[string]string{"": ""}
+			}
+		}
+		names := make([]string, 0, len(dirs))
+		for name := range dirs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, b := range names {
+			if watching[b] {
+				continue
+			}
+			watching[b] = true
+			wg.Add(1)
+			go func(b, dir string) {
+				defer wg.Done()
+				watchBoard(ctx, out, bin, b, dir, interval, backoff)
+			}(b, dirs[b])
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(rescan):
+		}
 	}
 	wg.Wait()
-	return nil
 }
 
 // watchBoard runs `shepherd watch` for one board until ctx is cancelled,

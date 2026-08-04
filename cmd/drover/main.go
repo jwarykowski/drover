@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/x/term"
 	"github.com/jwarykowski/drover/config"
@@ -74,7 +75,7 @@ Usage:
 Commands:
   watch      run every configured source and drive the loop
   action     author the actions in drover.toml (opens a TUI)
-  source     run a built-in source plugin (github | shepherd)
+  source     run a built-in source plugin (github | shepherd | webhook)
   doctor     check the config: sources, agents and their binaries
   version    print the version and exit
   help       print this help
@@ -95,9 +96,12 @@ source: run a source plugin, writing NDJSON events to stdout. Normally spawned
 by watch through a [[source]] row rather than by hand.
   drover source github --repo owner/name [--mode poll|forward] [--base branch]
   drover source shepherd [--board name] [--all]
+  drover source webhook [--addr host:port] --map '<jq program>'
 
 A source is any process that writes drover's event envelope to stdout, or any
-service that POSTs it to a [[source]] http address — these two ship in the box.`
+service that POSTs it to a [[source]] http address — these three ship in the box.
+webhook is the generic one: it accepts any provider's JSON and maps it to the
+envelope with jq, so a new SaaS feed is a config row rather than a plugin.`
 
 // watch runs the closed loop: every configured source streams events, each
 // event is matched against the actions in drover.toml, a match parks a run, and
@@ -140,18 +144,64 @@ func watch(ctx context.Context, argv []string) error {
 // ExecSource any third-party plugin gets.
 func sourceCmd(ctx context.Context, argv []string) error {
 	if len(argv) == 0 {
-		return fmt.Errorf("source: missing plugin name (github | shepherd)")
+		return fmt.Errorf("source: missing plugin name (github | shepherd | webhook)")
 	}
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	ctx, orphaned := watchParent(ctx, os.Getppid, 2*time.Second)
+	defer orphaned()
 	switch argv[0] {
 	case "github":
 		return sourceGitHub(ctx, argv[1:])
 	case "shepherd":
 		return sourceShepherd(ctx, argv[1:])
+	case "webhook":
+		return sourceWebhook(ctx, argv[1:])
 	default:
-		return fmt.Errorf("source: unknown plugin %q (want github or shepherd)", argv[0])
+		return fmt.Errorf("source: unknown plugin %q (want github, shepherd or webhook)", argv[0])
 	}
+}
+
+// watchParent cancels ctx once this process has been orphaned, so a shim outlives
+// whatever spawned it by at most one tick.
+//
+// ExecSource group-SIGTERMs a plugin on shutdown (source/exec.go), but that only
+// runs if the spawner lives long enough to run it. A SIGKILLed, crashed or
+// force-quit parent runs nothing, and every shim it started is reparented to init
+// still holding its port and its own children — after which the next launch cannot
+// bind. PR_SET_PDEATHSIG is Linux-only, so the portable signal is the child
+// noticing it has been reparented.
+//
+// Cancelling rather than exiting is the point: each shim already shuts down
+// cleanly on ctx — webhook closes its listener, shepherd reaps its `shepherd
+// watch` children — which is the same path SIGTERM takes.
+//
+// ponytail: a poll, not an inherited pipe whose EOF says the same thing exactly.
+// A pipe needs cooperation from every spawner, and two seconds of a doomed shim
+// costs nothing.
+func watchParent(ctx context.Context, getppid func() int, every time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	// Started by init directly (a launchd job), so there is no parent to outlive
+	// and no reparenting left to detect.
+	if start := getppid(); start != 1 {
+		go func() {
+			t := time.NewTicker(every)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if getppid() != start {
+						fmt.Fprintln(os.Stderr, "parent gone; shutting down")
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+	return ctx, cancel
 }
 
 // actionCmd is the CRUD UI over the actions in drover.toml. This is the only

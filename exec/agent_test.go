@@ -426,7 +426,7 @@ func TestAgentExecutorDetachedRunSkipsReconcile(t *testing.T) {
 	}
 }
 
-func TestAgentExecutorUnknownActionNotesLeavesRunning(t *testing.T) {
+func TestAgentExecutorUnknownActionClosesTheTask(t *testing.T) {
 	st := &store.FakeStore{}
 	st.Seed(loop.Task{ID: "t1", Status: "running", Action: "ghost"})
 	ran := false
@@ -442,11 +442,17 @@ func TestAgentExecutorUnknownActionNotesLeavesRunning(t *testing.T) {
 	if ran {
 		t.Fatal("a missing action id must never fall through to execution")
 	}
-	items, _ := st.List(context.Background(), loop.Filter{IncludeDone: true})
-	if items[0].Done {
-		t.Fatal("a missing action must NOT close the task")
+	// Nothing can ever run this task, so it closes out rather than sitting
+	// claimed at running where it reads like work in flight — and where a
+	// second release would only block again.
+	if live, _ := st.List(context.Background(), loop.Filter{IncludeDone: true}); len(live) != 0 {
+		t.Fatalf("a missing action should archive the task off the live lanes, got %#v", live)
 	}
-	if items[0].Note == "" {
+	done := st.Archived()
+	if len(done) != 1 || !done[0].Done {
+		t.Fatalf("want one archived, done task, got %#v", done)
+	}
+	if done[0].Note == "" {
 		t.Fatal("a missing action should leave a note explaining why the task never ran")
 	}
 }

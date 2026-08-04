@@ -28,13 +28,13 @@ func TestHTTPSourceAcceptsPostedEvents(t *testing.T) {
 	defer cancel()
 
 	addr := freeAddr(t)
-	src := HTTPSource{Name: "sentry", Addr: addr}
+	src := HTTPSource{Name: "remote", Addr: addr}
 	ch := src.Events(ctx)
 
 	url := "http://" + addr + "/events"
 	body := strings.Join([]string{
-		`{"id":"e1","type":"sentry.issue.opened","data":{"title":"boom","subject":"S-1"}}`,
-		`{"id":"e2","type":"sentry.issue.opened","data":{"title":"bang","subject":"S-2"}}`,
+		`{"id":"e1","type":"remote.ping","data":{"title":"boom","subject":"S-1"}}`,
+		`{"id":"e2","type":"remote.ping","data":{"title":"bang","subject":"S-2"}}`,
 	}, "\n")
 
 	// The listener comes up asynchronously; retry briefly rather than sleeping.
@@ -62,7 +62,7 @@ func TestHTTPSourceAcceptsPostedEvents(t *testing.T) {
 			if e.ID != want {
 				t.Fatalf("event %d = %q, want %q", i, e.ID, want)
 			}
-			if e.Source != "sentry" {
+			if e.Source != "remote" {
 				t.Fatalf("source should default to the config name, got %q", e.Source)
 			}
 		case <-time.After(2 * time.Second):
@@ -78,7 +78,7 @@ func TestHTTPSourceRejectsNonPost(t *testing.T) {
 	defer cancel()
 
 	addr := freeAddr(t)
-	src := HTTPSource{Name: "sentry", Addr: addr}
+	src := HTTPSource{Name: "remote", Addr: addr}
 	ch := src.Events(ctx)
 
 	url := "http://" + addr + "/events"

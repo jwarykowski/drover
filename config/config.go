@@ -317,6 +317,50 @@ func (c *Config) Sources() []Source {
 	return out
 }
 
+// UpsertSource adds s, or overwrites the row with the same Name. Unlike
+// AddRunner a duplicate is not an error: a source row is fully described by its
+// own fields, so installing the same one twice must be idempotent rather than
+// something the caller has to check for first.
+//
+// Exactly one transport must be set. build skips a row with both or neither
+// (daemon/daemon.go), and a source that is silently never spawned is a far worse
+// failure than a rejected write.
+func (c *Config) UpsertSource(s Source) error {
+	if strings.TrimSpace(s.Name) == "" {
+		return fmt.Errorf("config: source name is required")
+	}
+	switch {
+	case len(s.Cmd) > 0 && s.HTTP != "":
+		return fmt.Errorf("config: source %q sets both cmd and http", s.Name)
+	case len(s.Cmd) == 0 && s.HTTP == "":
+		return fmt.Errorf("config: source %q sets neither cmd nor http", s.Name)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.Source {
+		if c.Source[i].Name == s.Name {
+			c.Source[i] = s
+			return nil
+		}
+	}
+	c.Source = append(c.Source, s)
+	return nil
+}
+
+// RemoveSource drops the source row with name; ErrNotFound if absent. The process
+// it names keeps running until the daemon restarts, same as adding one.
+func (c *Config) RemoveSource(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, s := range c.Source {
+		if s.Name == name {
+			c.Source = append(c.Source[:i], c.Source[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: source %s", ErrNotFound, name)
+}
+
 // ValidMode reports whether m is permitted for the named runner. A runner that
 // declares no modes accepts anything, since drover cannot know a third-party
 // tool's vocabulary.
