@@ -1,0 +1,124 @@
+# Starter drover.toml for the generic webhook source.
+#
+# `drover source webhook` binds a port, accepts whatever JSON a provider POSTs to
+# /events, and maps it to drover's envelope with a jq program from this file. So
+# adding a new SaaS feed is a [[source]] row, not a plugin — the shim never knows
+# which provider it is talking to.
+#
+# The mapping must produce at minimum {id, type}. Two rules the mapping owns:
+#   id       unique per logical EVENT (fold a timestamp or state in), or Dedup
+#            swallows every repeat forever
+#   subject  a STABLE id for the thing the event concerns — the
+#            one-run-at-a-time key. Two events about the same PR share a subject
+#            so a second run does not stack behind the first.
+#
+# The bind is localhost and unauthenticated: anything that can reach the port can
+# raise an event, and an event can select any action. To take deliveries from the
+# public internet, terminate them at a proxy that authenticates first (or use a
+# provider-side relay like `gh webhook forward`).
+#
+# Copy the rows you want into ~/.config/drover/drover.toml. Sources are read once
+# at startup, so restart watch (or corral) after adding one.
+
+# --- sources ------------------------------------------------------------------
+
+# Sentry. Create an internal integration (Settings → Developer Settings), tick
+# the `issue` webhook, and point its URL at http://127.0.0.1:9100/events.
+#
+# The issue id seeds the dedup key and doubles as the subject: `created` then
+# `resolved` for the same issue are two events (the action is in the id) but one
+# subject, so the second waits rather than running alongside the first.
+#
+# Optional fields default to "" so a payload that omits one still delivers; only
+# the issue id is required, because it is the dedup key. This maps the current
+# `issue` webhook resource only — no fallbacks for older payload shapes.
+[[source]]
+name = "sentry"
+cmd = [
+	"drover",
+	"source",
+	"webhook",
+	"--addr",
+	"127.0.0.1:9100",
+	"--map",
+	'{id: "sentry:\(.data.issue.id):\(.action)", type: "sentry.issue.\(.action)", data: {title: (.data.issue.title // ""), subject: .data.issue.id, url: (.data.issue.web_url // ""), culprit: (.data.issue.culprit // ""), project: (.data.issue.project.slug // ""), short_id: (.data.issue.shortId // ""), level: (.data.issue.level // "")}}',
+]
+types = ["sentry.issue.created", "sentry.issue.resolved", "sentry.issue.ignored"]
+
+# Datadog. Monitor notification with a custom @webhook payload, e.g.
+#   {"id":"$ALERT_ID","title":"$EVENT_TITLE","monitor":"$ALERT_METRIC","link":"$LINK","transition":"$ALERT_TRANSITION"}
+[[source]]
+name = "datadog"
+cmd = [
+	"drover",
+	"source",
+	"webhook",
+	"--addr",
+	"127.0.0.1:9110",
+	"--map",
+	'{id: "dd:\(.id)", type: "datadog.alert.\(.transition | ascii_downcase)", data: {title: .title, subject: .monitor, url: .link}}',
+]
+types = ["datadog.alert.triggered", "datadog.alert.recovered"]
+
+# A batched payload fans out: one input delivery, several events. jq emitting N
+# objects means N lines means N events, each needing its own id.
+[[source]]
+name = "alertmanager"
+cmd = [
+	"drover",
+	"source",
+	"webhook",
+	"--addr",
+	"127.0.0.1:9120",
+	"--map",
+	'.alerts[] | {id: "am:\(.fingerprint):\(.status)", type: "alertmanager.\(.status)", data: {title: .labels.alertname, subject: .fingerprint, url: (.generatorURL // "")}}',
+]
+types = ["alertmanager.firing", "alertmanager.resolved"]
+
+# Anything that already speaks the envelope needs no mapping at all — a Claude
+# Code hook, a git hook, a macOS Shortcut, a cron line. The default map is `.`,
+# an identity filter, so this row is just a validating front door.
+#
+#	git config --local --add hooks.drover 1
+#	# .git/hooks/post-commit
+#	curl -sf -XPOST --data-binary @- http://127.0.0.1:9130/events <<-JSON
+#	{"id":"git:$(git rev-parse HEAD)","type":"git.commit",
+#	 "data":{"title":"$(git log -1 --pretty=%s)","subject":"$(git rev-parse --abbrev-ref HEAD)","dir":"$(git rev-parse --show-toplevel)"}}
+#	JSON
+[[source]]
+name = "local"
+cmd = ["drover", "source", "webhook", "--addr", "127.0.0.1:9130"]
+types = ["git.commit", "claude.session.stop", "shortcut.run"]
+
+# --- runner -------------------------------------------------------------------
+[[runner]]
+name = "claude"
+cmd = [
+	"claude",
+	"-p",
+	"{{prompt}}",
+	"--permission-mode",
+	"{{mode}}",
+	"--output-format",
+	"stream-json",
+	"--verbose",
+]
+modes = ["bypassPermissions", "acceptEdits"]
+
+# --- actions ------------------------------------------------------------------
+
+# fields: title, subject, url, culprit, project
+[[action]]
+name = "on-sentry-issue"
+on = "sentry.issue.created"
+runner = "claude"
+mode = "acceptEdits"
+do = "Sentry raised a new issue in {{project}}: {{title}} (culprit: {{culprit}}). Details: {{url}}. Find the root cause in this repo and propose the smallest fix. If the cause is not in this codebase, say so and stop."
+
+# fields: title, subject, url
+[[action]]
+name = "on-alert-firing"
+on = "alertmanager.firing"
+runner = "claude"
+mode = "acceptEdits"
+do = "Alert {{title}} is firing ({{url}}). Check whether a recent change in this repo explains it; report what you find before changing anything."
