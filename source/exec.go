@@ -89,8 +89,15 @@ func (s ExecSource) stream(ctx context.Context, out chan<- loop.Event) error {
 	}
 	scanErr := Scan(ctx, stdout, out, s.Name, s.logf)
 	// CommandContext terminates the group on ctx cancel; reap it either way.
-	_ = cmd.Wait()
-	return scanErr
+	waitErr := cmd.Wait()
+	// The exit status is what explains a shim that dies immediately — a binary
+	// too old for the subcommand, a port already bound, jq missing. Discarding it
+	// left "ended (<nil>); restarting in 1s" looping every second with the reason
+	// nowhere, so a clean scan reports how the process actually exited.
+	if scanErr != nil {
+		return scanErr
+	}
+	return waitErr
 }
 
 // Scan reads NDJSON from r and emits one event per line. Split out from the
