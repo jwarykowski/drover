@@ -130,7 +130,7 @@ func build(cf *config.Config, seen source.Seen, logf func(string, ...any)) ([]lo
 			logf("source %q sets both cmd and http; skipping", s.Name)
 			continue
 		case len(s.Cmd) > 0:
-			src = source.ExecSource{Name: s.Name, Cmd: s.Cmd, Logf: logf}
+			src = source.ExecSource{Name: s.Name, Cmd: s.Cmd, Logf: logf, Stderr: shimLog{name: s.Name, logf: logf}}
 		case s.HTTP != "":
 			src = source.HTTPSource{Name: s.Name, Addr: s.HTTP, Logf: logf}
 		default:
@@ -141,6 +141,24 @@ func build(cf *config.Config, seen source.Seen, logf func(string, ...any)) ([]lo
 		names = append(names, s.Name)
 	}
 	return srcs, names
+}
+
+// shimLog routes a plugin's stderr into the daemon log. Without a sink it is
+// discarded, and the one thing a source that will not start has to say — an
+// unknown subcommand, a bound port, a missing jq — is exactly what it prints
+// there before exiting.
+type shimLog struct {
+	name string
+	logf func(string, ...any)
+}
+
+func (w shimLog) Write(p []byte) (int, error) {
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			w.logf("source %q: %s", w.name, t)
+		}
+	}
+	return len(p), nil
 }
 
 func join(names []string) string {
