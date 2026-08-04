@@ -15,9 +15,9 @@ cmd   = ["drover", "source", "shepherd"]
 types = ["shepherd.added", "shepherd.updated"]
 
 [[source]]
-name  = "sentry"
+name  = "remote"
 http  = "127.0.0.1:9100"
-types = ["sentry.issue.opened"]
+types = ["remote.ping"]
 
 [[runner]]
 name  = "claude"
@@ -117,7 +117,7 @@ func TestRunnerByName(t *testing.T) {
 // plugin's own event types appear without drover being rebuilt.
 func TestTypesUnionsWhatSourcesDeclare(t *testing.T) {
 	c := load(t, sample)
-	want := []string{"sentry.issue.opened", "shepherd.added", "shepherd.updated"}
+	want := []string{"remote.ping", "shepherd.added", "shepherd.updated"}
 	if got := c.Types(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Types() = %v, want %v", got, want)
 	}
@@ -219,6 +219,66 @@ func TestRiskyIsAutoPlusAPermissionWaivingMode(t *testing.T) {
 	}
 	if (Action{Auto: true, Mode: "acceptEdits"}).Risky() {
 		t.Error("auto alone with a prompting mode is not the flagged case")
+	}
+}
+
+// A source row is fully described by its own fields, so writing the same name
+// twice replaces rather than appending — otherwise installing a preset twice
+// would leave two rows racing for the same port. The new types must also reach
+// Types(), since that is what the action editor offers.
+func TestUpsertSourceIsIdempotent(t *testing.T) {
+	c := &Config{}
+	row := Source{Name: "sentry", Cmd: []string{"drover", "source", "webhook"}, Types: []string{"sentry.issue.created"}}
+	if err := c.UpsertSource(row); err != nil {
+		t.Fatal(err)
+	}
+	row.Types = append(row.Types, "sentry.issue.resolved")
+	if err := c.UpsertSource(row); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Sources(); len(got) != 1 {
+		t.Fatalf("upsert appended instead of replacing: %+v", got)
+	}
+	if got := c.Types(); !reflect.DeepEqual(got, []string{"sentry.issue.created", "sentry.issue.resolved"}) {
+		t.Fatalf("Types() did not pick up the replacement: %v", got)
+	}
+}
+
+// Removing a source has to drop that row and leave the rest: a feed that installs
+// one row per repo is the reason it exists.
+func TestRemoveSource(t *testing.T) {
+	c := &Config{}
+	for _, n := range []string{"github/acme/api", "github/acme/web"} {
+		if err := c.UpsertSource(Source{Name: n, Cmd: []string{"drover", "source", "github"}, Types: []string{"github.issues.opened"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.RemoveSource("github/acme/api"); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Sources(); len(got) != 1 || got[0].Name != "github/acme/web" {
+		t.Fatalf("RemoveSource left %+v", got)
+	}
+	if err := c.RemoveSource("github/acme/api"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removing an absent row: want ErrNotFound, got %v", err)
+	}
+}
+
+// A row with both transports or neither is skipped by daemon.build, so it is
+// rejected at the write instead of silently never being spawned.
+func TestUpsertSourceRequiresExactlyOneTransport(t *testing.T) {
+	c := &Config{}
+	for _, s := range []Source{
+		{Name: "", Cmd: []string{"x"}},
+		{Name: "both", Cmd: []string{"x"}, HTTP: "127.0.0.1:9100"},
+		{Name: "neither"},
+	} {
+		if err := c.UpsertSource(s); err == nil {
+			t.Fatalf("want an error for %+v", s)
+		}
+	}
+	if len(c.Sources()) != 0 {
+		t.Fatalf("a rejected row must not be written: %+v", c.Sources())
 	}
 }
 
